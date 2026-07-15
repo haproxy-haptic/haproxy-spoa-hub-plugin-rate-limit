@@ -1,4 +1,4 @@
-# haproxy-spoa-hub-plugin-ratelimit — development context
+# haproxy-spoa-hub-plugin-rate-limit — development context
 
 Shared, low-latency rate-limiting plugin for haproxy-spoa-hub. Rust cdylib
 against `haproxy-spoa-hub-plugin-api` (the `define_plugin!` vtable), edition 2024.

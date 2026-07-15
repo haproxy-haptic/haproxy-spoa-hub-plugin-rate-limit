@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.86"
 description = "Shared low-latency (local-first, lease-amortized) rate-limiting + quotas plugin for haproxy-spoa-hub"
 license = "Apache-2.0"
-repository = "https://gitlab.com/haproxy-haptic/haproxy-spoa-hub-plugin-ratelimit"
+repository = "https://gitlab.com/haproxy-haptic/haproxy-spoa-hub-plugin-rate-limit"
 
 [lib]
 # cdylib: the .so the hub dlopen's (librate_limit_plugin.so).

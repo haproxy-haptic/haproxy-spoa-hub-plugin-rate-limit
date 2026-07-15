@@ -1,4 +1,4 @@
-# Design: `haproxy-spoa-hub-plugin-ratelimit`
+# Design: `haproxy-spoa-hub-plugin-rate-limit`
 
 Shared, cross-fleet rate limiting + quotas for HAPTIC, as a new Rust SPOA plugin.
 Status: **design for review** — no repo created yet. Phase 4 of the API-gateway plan.
@@ -19,7 +19,7 @@ annotations **stay** as the plugin-free fallback; the plugin is opt-in for fleet
 Same shape as the existing plugins (spec-kit workflow, `define_plugin!` API):
 
 ```
-haproxy-spoa-hub-plugin-ratelimit/
+haproxy-spoa-hub-plugin-rate-limit/
   Cargo.toml            # cdylib+rlib; edition 2024; LTO release
   src/lib.rs            # define_plugin!(RateLimitPlugin, {...}); init/process
   src/plugin.rs         # SPOE glue: SpoeMessage args -> Verdict -> ProcessingResult

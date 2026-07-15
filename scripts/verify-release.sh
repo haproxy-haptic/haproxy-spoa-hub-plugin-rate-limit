@@ -11,7 +11,7 @@ set -euo pipefail
 
 VERSION="${1:?usage: $0 <vX.Y.Z>}"
 
-PROJECT_PATH="haproxy-haptic/haproxy-spoa-hub-plugin-ratelimit"
+PROJECT_PATH="haproxy-haptic/haproxy-spoa-hub-plugin-rate-limit"
 PKG_NAME="rate-limit"
 PKG_BASE="https://gitlab.com/api/v4/projects/$(printf '%s' "${PROJECT_PATH}" | sed 's|/|%2F|g')/packages/generic/${PKG_NAME}/${VERSION}"
 

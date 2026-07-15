@@ -1,4 +1,4 @@
-# haproxy-spoa-hub-plugin-ratelimit
+# haproxy-spoa-hub-plugin-rate-limit
 
 Shared, cross-fleet **rate limiting + quotas** for [haproxy-spoa-hub](https://gitlab.com/haproxy-haptic/haproxy-spoa-hub),
 built for **low latency first**.
