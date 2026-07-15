@@ -52,8 +52,9 @@ impl std::error::Error for StoreError {}
 #[allow(async_fn_in_trait)]
 pub trait Store: Send + Sync {
     /// Reserve up to `requested` tokens from the global bucket for `key`,
-    /// refilling it at `rate` (tokens/s) capped at `burst`. `now_ms` is the
-    /// caller's clock; `ttl_ms` self-expires the key (≈ one refill period).
+    /// refilling it at `rate` (tokens/s) capped at `burst`. `ttl_ms`
+    /// self-expires the key. `now_ms` is a legacy/virtual-clock argument used by
+    /// `InMemoryStore`; `ValkeyStore` deliberately uses Valkey server time.
     async fn reserve(
         &self,
         key: &str,

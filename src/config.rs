@@ -13,7 +13,8 @@ pub struct PluginConfig {
     /// limits are then per-pod, like the stick-table fallback but through the
     /// plugin path.
     pub store_url: Option<String>,
-    /// Lease refresh interval T (ms). Bounds store QPS to ~pods/T.
+    /// Lease refresh interval T (ms). Store work is bounded by active keys and
+    /// refresh cadence rather than raw request RPS.
     pub interval_ms: u64,
     /// Low-water threshold as a percent of the batch (a request below it
     /// triggers an async prefetch). Default 20.
@@ -24,6 +25,14 @@ pub struct PluginConfig {
     pub breaker_threshold: u32,
     /// Circuit-breaker: open-state cooldown (ms) before a half-open probe.
     pub breaker_cooldown_ms: u64,
+    /// Maximum local keys retained by one sidecar.
+    pub max_keys: usize,
+    /// Milliseconds after which an inactive local key is evicted.
+    pub idle_ttl_ms: u64,
+    /// Timeout for one shared-store operation.
+    pub store_timeout_ms: u64,
+    /// Bounded low-water prefetch queue size.
+    pub max_prefetch_queue: usize,
 }
 
 impl PluginConfig {
@@ -55,6 +64,10 @@ impl PluginConfig {
             ttl_ms: get_u64("ttl_ms", 60_000, 1, 3_600_000),
             breaker_threshold: get_u64("breaker_threshold", 5, 1, 1_000) as u32,
             breaker_cooldown_ms: get_u64("breaker_cooldown_ms", 5_000, 1, 600_000),
+            max_keys: get_u64("max_keys", 50_000, 1, 10_000_000) as usize,
+            idle_ttl_ms: get_u64("idle_ttl_ms", 120_000, 1_000, 86_400_000),
+            store_timeout_ms: get_u64("store_timeout_ms", 25, 1, 60_000),
+            max_prefetch_queue: get_u64("max_prefetch_queue", 8_192, 1, 1_000_000) as usize,
         })
     }
 
@@ -68,7 +81,11 @@ impl PluginConfig {
     "low_water_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
     "ttl_ms": { "type": "integer", "minimum": 1 },
     "breaker_threshold": { "type": "integer", "minimum": 1 },
-    "breaker_cooldown_ms": { "type": "integer", "minimum": 1 }
+    "breaker_cooldown_ms": { "type": "integer", "minimum": 1 },
+    "max_keys": { "type": "integer", "minimum": 1 },
+    "idle_ttl_ms": { "type": "integer", "minimum": 1000 },
+    "store_timeout_ms": { "type": "integer", "minimum": 1 },
+    "max_prefetch_queue": { "type": "integer", "minimum": 1 }
   }
 }"#
     }

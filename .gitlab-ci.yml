@@ -56,7 +56,7 @@ fmt:
   before_script:
     - rustup component add rustfmt
   script:
-    - cargo fmt -- --check
+    - make fmt
 
 clippy:
   stage: check
@@ -70,7 +70,7 @@ clippy:
     - !reference [.rules-code, rules]
   script:
     - rustup component add clippy
-    - cargo clippy --workspace --all-targets -- -D warnings
+    - make lint
 
 test:
   stage: check
@@ -83,7 +83,7 @@ test:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - !reference [.rules-code, rules]
   script:
-    - cargo test --workspace
+    - make test
 
 # Acceptance tests against a REAL Valkey (the Lua reservation's atomicity, GCRA
 # exactness under concurrency). A services: Valkey provides the instance;
@@ -104,7 +104,7 @@ acceptance:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - !reference [.rules-code, rules]
   script:
-    - cargo test --test valkey_acceptance
+    - make acceptance
 
 # =============================================================================
 # Build stage — multi-arch cdylib. Runs on main + code-change MRs (proves the

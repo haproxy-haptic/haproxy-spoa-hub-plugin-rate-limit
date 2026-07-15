@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-15
+
+### Added
+
+- Bound local lease-manager state with `max_keys` and `idle_ttl_ms` to cap
+  memory and periodic refresh work under high-cardinality traffic.
+- Disable optimistic cold-starts for new keys inserted after capacity eviction,
+  preventing high-cardinality key cycling from minting fresh local tokens.
+- Bound and coalesce low-water prefetch work with `max_prefetch_queue` so hot
+  over-limit keys cannot grow an unbounded refresh backlog.
+- Add `store_timeout_ms` and enforce it around Valkey reservation and exact GCRA
+  checks.
+- Add a local `acceptance-docker` make target that runs the Valkey acceptance
+  suite against a disposable real Valkey container.
+
+### Changed
+
+- Valkey Lua scripts now use Valkey server time for refill/GCRA calculations
+  instead of trusting each sidecar's wall clock.
+- Valkey connections are established lazily and retried after failures, so
+  plugin initialization no longer permanently fails when the store Service is
+  not ready during pod startup.
+- Existing lease entries now apply rule changes immediately instead of keeping
+  stale limits until a plugin reload.
+
+### Fixed
+
+- Exact mode now fails closed on slow store operations before the hub/SPOE
+  timeout budget is exhausted.
+
 ## [0.1.1] - 2026-07-15
 
 ### Fixed

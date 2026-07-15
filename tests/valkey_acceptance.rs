@@ -63,9 +63,9 @@ async fn reserve_grants_then_drains_the_global_bucket() {
     let key = unique_key("drain");
     let now = 1_000_000u64;
 
-    // Fresh key: rate 10/s, burst 100. Request 30 → grant 30, remaining 70.
+    // Fresh key: burst 100, no refill. Request 30 → grant 30, remaining 70.
     let r = s
-        .reserve(&key, 10.0, 100.0, 30.0, now, TTL_MS)
+        .reserve(&key, 0.0, 100.0, 30.0, now, TTL_MS)
         .await
         .unwrap();
     assert_eq!(r.granted, 30.0);
@@ -75,19 +75,16 @@ async fn reserve_grants_then_drains_the_global_bucket() {
         r.remaining
     );
 
-    // Request 80 with no time passed → only 70 left → grant 70, remaining 0.
+    // Request 80 immediately → only 70 left → grant 70, remaining 0.
     let r2 = s
-        .reserve(&key, 10.0, 100.0, 80.0, now, TTL_MS)
+        .reserve(&key, 0.0, 100.0, 80.0, now, TTL_MS)
         .await
         .unwrap();
     assert!((r2.granted - 70.0).abs() < 1e-6, "granted={}", r2.granted);
     assert!(r2.remaining.abs() < 1e-6);
 
     // Empty → grant 0.
-    let r3 = s
-        .reserve(&key, 10.0, 100.0, 5.0, now, TTL_MS)
-        .await
-        .unwrap();
+    let r3 = s.reserve(&key, 0.0, 100.0, 5.0, now, TTL_MS).await.unwrap();
     assert_eq!(r3.granted, 0.0);
 }
 
@@ -99,11 +96,11 @@ async fn grant_is_min_of_requested_and_available() {
     let key = unique_key("min");
     let now = 2_000_000u64;
     // burst 50, request 20 → grant 20 (requested < available).
-    let r = s.reserve(&key, 1.0, 50.0, 20.0, now, TTL_MS).await.unwrap();
+    let r = s.reserve(&key, 0.0, 50.0, 20.0, now, TTL_MS).await.unwrap();
     assert_eq!(r.granted, 20.0);
     // request 100 → grant 30 (available < requested).
     let r2 = s
-        .reserve(&key, 1.0, 50.0, 100.0, now, TTL_MS)
+        .reserve(&key, 0.0, 50.0, 100.0, now, TTL_MS)
         .await
         .unwrap();
     assert_eq!(r2.granted, 30.0);
@@ -116,33 +113,32 @@ async fn refills_over_time_capped_at_burst() {
     };
     let key = unique_key("refill");
     let now = 5_000_000u64;
-    // burst 10, rate 10/s. Drain it.
+    // burst 10, rate 100/s. Drain it.
     assert_eq!(
-        s.reserve(&key, 10.0, 10.0, 10.0, now, TTL_MS)
+        s.reserve(&key, 100.0, 10.0, 10.0, now, TTL_MS)
             .await
             .unwrap()
             .granted,
         10.0
     );
-    assert_eq!(
-        s.reserve(&key, 10.0, 10.0, 5.0, now, TTL_MS)
-            .await
-            .unwrap()
-            .granted,
-        0.0
-    );
-    // 500ms later → 5 tokens refilled (10/s × 0.5s).
+    // Valkey TIME, not the caller's now_ms, is authoritative.
+    tokio::time::sleep(Duration::from_millis(60)).await;
     let r = s
-        .reserve(&key, 10.0, 10.0, 5.0, now + 500, TTL_MS)
+        .reserve(&key, 100.0, 10.0, 10.0, now, TTL_MS)
         .await
         .unwrap();
-    assert!((r.granted - 5.0).abs() < 1e-6, "granted={}", r.granted);
-    // A long time later → capped at burst 10, not rate×elapsed.
+    assert!(
+        (1.0..=10.0).contains(&r.granted),
+        "server-time refill granted={}",
+        r.granted
+    );
+    // After enough real time, refill is capped at burst.
+    tokio::time::sleep(Duration::from_millis(150)).await;
     let r2 = s
-        .reserve(&key, 10.0, 10.0, 1000.0, now + 100_000, TTL_MS)
+        .reserve(&key, 100.0, 10.0, 1000.0, now, TTL_MS)
         .await
         .unwrap();
-    assert_eq!(r2.granted, 10.0);
+    assert!(r2.granted <= 10.0);
 }
 
 #[tokio::test]
@@ -235,6 +231,7 @@ async fn fleet_of_lease_managers_shares_one_valkey_bucket() {
         interval_ms,
         low_water: 0.2,
         ttl_ms: TTL_MS,
+        ..LeaseConfig::default()
     };
     let pods: Vec<_> = (0..n_pods)
         .map(|_| {
@@ -253,6 +250,7 @@ async fn fleet_of_lease_managers_shares_one_valkey_bucket() {
         cost: 1.0,
     };
     let base = Instant::now();
+    let wall_start = Instant::now();
     let duration_ms = 3_000u64;
     // batch = rate*interval clamped to [1, burst] = 50*0.2 = 10.
     let batch = (rule.limit / rule.period_s * (interval_ms as f64) / 1000.0)
@@ -273,15 +271,15 @@ async fn fleet_of_lease_managers_shares_one_valkey_bucket() {
         }
     }
 
-    let global_cap = rule.burst + rule.limit / rule.period_s * (duration_ms as f64) / 1000.0;
+    let wall_elapsed_s = wall_start.elapsed().as_secs_f64();
+    let global_cap = rule.burst + rule.limit / rule.period_s * wall_elapsed_s;
     let bound = (global_cap + (n_pods as f64) * batch).ceil() as u64 + n_pods as u64;
     assert!(
         admitted <= bound,
         "fleet admitted {admitted} exceeded shared bound {bound} (global_cap {global_cap}, N*B {})",
         n_pods as f64 * batch
     );
-    let per_pod_would_be =
-        rule.limit / rule.period_s * (n_pods as f64) * (duration_ms as f64) / 1000.0;
+    let per_pod_would_be = rule.limit / rule.period_s * (n_pods as f64) * wall_elapsed_s.max(1.0);
     assert!(
         (admitted as f64) < per_pod_would_be * 0.6,
         "fleet admitted {admitted} looks per-pod ({per_pod_would_be}), not shared via Valkey"
@@ -298,7 +296,7 @@ async fn exact_gcra_against_valkey_enforces_and_never_over_admits() {
     };
     let key = unique_key("gcra");
     let now = 1_000_000u64;
-    // rate 4/s, burst 1 => allow one, deny the next, allow after 250ms.
+    // rate 4/s, burst 1 => allow one, deny the next, allow after retry_after.
     assert!(
         s.gcra_check(&key, 4.0, 1.0, 1.0, now, TTL_MS)
             .await
@@ -315,8 +313,9 @@ async fn exact_gcra_against_valkey_enforces_and_never_over_admits() {
         "retry={}",
         v.retry_after_ms
     );
+    tokio::time::sleep(Duration::from_millis(v.retry_after_ms + 10)).await;
     assert!(
-        s.gcra_check(&key, 4.0, 1.0, 1.0, now + 250, TTL_MS)
+        s.gcra_check(&key, 4.0, 1.0, 1.0, now, TTL_MS)
             .await
             .unwrap()
             .allowed
@@ -333,7 +332,7 @@ async fn exact_gcra_against_valkey_enforces_and_never_over_admits() {
         let ckey = ckey.clone();
         let a = Arc::clone(&admitted);
         handles.push(tokio::spawn(async move {
-            if s.gcra_check(&ckey, 1.0, 10.0, 1.0, 2_000_000, TTL_MS)
+            if s.gcra_check(&ckey, 0.001, 10.0, 1.0, 2_000_000, TTL_MS)
                 .await
                 .unwrap()
                 .allowed

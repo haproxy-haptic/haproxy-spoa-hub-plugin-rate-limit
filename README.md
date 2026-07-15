@@ -9,39 +9,45 @@ store (Valkey/Redis) **off the per-request hot path**.
 
 ## Design in one paragraph
 
-Local-first, lease-amortized token bucket. Each sidecar holds an in-process token
-bucket per limit-key and decides allow/deny **entirely in memory** (tens of
-nanoseconds, zero network). Valkey is only a *budget allocator*: a sidecar
-**leases** a slice of the global rate on a time cadence `T` and spends it locally,
-so **Valkey QPS ≈ pods/T, independent of request RPS**. Global limits are
-*approximate but bounded* — instantaneous overshoot ≤ `N_pods × lease_size`, while
-the sustained rate stays ≤ the limit. An in-process negative cache short-circuits
-already-throttled abusers with no Valkey contact, and a circuit breaker **fails
-static** (keeps enforcing the last lease) through a store outage. An opt-in
-**exact mode** (synchronous GCRA per request) is available for money/contract
-limits. See [`specs/001-ratelimit-plugin/design.md`](specs/001-ratelimit-plugin/design.md).
+Local-first, lease-amortized token bucket. Each sidecar holds a bounded
+in-process token bucket per limit-key and decides the default `lease` mode
+allow/deny **entirely in memory**. Valkey is a budget allocator: a sidecar
+**leases** a slice of the global rate on a time cadence `T` and spends it
+locally. Store work is proportional to active keys and refresh cadence, not raw
+request RPS; local state is bounded by `max_keys`, idle entries are evicted by
+`idle_ttl_ms`, and low-water refreshes are coalesced through a bounded queue.
+Global limits are approximate but bounded — instantaneous overshoot is at most
+`N_pods × lease_size` plus cold-start optimism, while sustained throughput stays
+within the shared store's grants. Under `max_keys` pressure, newly inserted keys
+created by capacity eviction start empty instead of optimistic, so
+high-cardinality traffic cannot mint fresh local tokens by cycling keys. A
+circuit breaker **fails static** (keeps enforcing the last local lease) through a
+store outage. An opt-in **exact mode** (synchronous GCRA per request) is
+available for low-volume money/contract limits and fails closed on store errors
+or store-operation timeouts. See
+[`specs/001-ratelimit-plugin/design.md`](specs/001-ratelimit-plugin/design.md).
 
 ## Status
 
-Under active development. Implemented so far:
+Under active development, but the shared rate-limit path is implemented:
 
-- **Phase 1 — local enforcement core.** The per-request hot path: a lazy-refill
-  token bucket (`src/bucket.rs`), the per-key limiter (`src/limiter.rs`), rule
-  parsing (`src/rule.rs`), and the SPOE `process()` glue (`src/plugin.rs`).
-- **Circuit breaker** (`src/breaker.rs`, fail-static) + **L1 negative cache**
-  (`src/negcache.rs`) — the resilience/short-circuit components.
-- **Shared-tier Valkey store** (`src/store/`) — the atomic single-key Lua
-  reservation (`reserve.lua`), the budget allocator the lease manager talks to.
+- Local token bucket, rule parsing, and SPOE `process()` glue.
+- Lease manager with bounded local key state, idle eviction, bounded/coalesced
+  low-water prefetch, fail-static circuit breaker, and immediate rule-update
+  convergence for active keys. Capacity-pressure cold starts require a shared
+  lease before admitting traffic.
+- Valkey store with atomic single-key Lua reservation and GCRA scripts. Scripts
+  use Valkey server time rather than sidecar wall clocks.
+- Lazy Valkey connection/reconnection so startup does not permanently fail when
+  the store is not ready yet.
 
-**Tested:** 33 in-process tests incl. a thorough rate-limiting correctness suite
-(`tests/algorithm_correctness.rs`: windowed safety, sustained rate, burst,
-recovery, cost, concurrency/no-double-spend), plus **acceptance tests against a
-real Valkey** (`tests/valkey_acceptance.rs`, incl. the Lua reservation's
-atomicity under 500-way concurrency).
+**Tested:** in-process correctness tests for windowed safety, sustained rate,
+burst, recovery, cost, concurrency/no-double-spend, lease overshoot, bounded key
+state, refresh coalescing, rule updates, and store timeout behavior; plus
+acceptance tests against a real Valkey (`make acceptance-docker`) for Lua
+reservation atomicity, fleet-shared leasing, server-time refill, and exact GCRA.
 
-Next: the lease manager (time-based leasing + async low-water prefetch, wiring the
-store into the local buckets), then chart wiring + cross-pod e2e (Phase 3), quotas
-+ exact GCRA + high-cardinality CMS (Phase 4).
+Next: quota/window algorithms and richer key derivation.
 
 ## SPOE contract
 
@@ -52,9 +58,10 @@ Message `check-ratelimit`. Args in: `key`, `limit`, `period`, `burst`, `cost`,
 ## Build & test
 
 ```sh
-cargo test          # unit tests
-cargo clippy --all-targets -- -D warnings
-cargo build --release   # -> target/release/librate_limit_plugin.so
+make test
+make lint
+make acceptance-docker  # requires Docker; starts disposable Valkey
+make build              # -> target/release/librate_limit_plugin.so
 ```
 
 ## License
