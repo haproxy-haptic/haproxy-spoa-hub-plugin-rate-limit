@@ -54,6 +54,21 @@ impl Store for AnyStore {
             AnyStore::Memory(s) => s.reserve(key, rate, burst, requested, now_ms, ttl_ms).await,
         }
     }
+
+    async fn gcra_check(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<crate::store::GcraVerdict, StoreError> {
+        match self {
+            AnyStore::Valkey(s) => s.gcra_check(key, rate, burst, cost, now_ms, ttl_ms).await,
+            AnyStore::Memory(s) => s.gcra_check(key, rate, burst, cost, now_ms, ttl_ms).await,
+        }
+    }
 }
 
 struct PrefetchReq {
@@ -209,6 +224,33 @@ define_plugin!(RateLimitPlugin, {
                 return Ok(build_result(&v));
             }
         };
+
+        // Exact mode (money/contract limits): a synchronous GCRA round-trip per
+        // request — the deliberate exactness/latency trade, scoped to opted-in
+        // keys, never the fleet default.
+        if message
+            .get_string("mode")
+            .is_some_and(|m| m.eq_ignore_ascii_case("exact"))
+        {
+            let runtime = RUNTIME
+                .get()
+                .ok_or("plugin not initialized: runtime missing")?;
+            let verdict =
+                runtime.block_on(manager.exact_check(key, &rule, wall_ms(), Instant::now()));
+            METRICS.counter(
+                "ratelimit_requests_total",
+                &[(
+                    "outcome",
+                    if verdict.allowed {
+                        "exact_allowed"
+                    } else {
+                        "exact_limited"
+                    },
+                )],
+                1,
+            );
+            return Ok(build_result(&verdict));
+        }
 
         let (verdict, needs_refresh) = manager.check(key, &rule, Instant::now());
         if needs_refresh {

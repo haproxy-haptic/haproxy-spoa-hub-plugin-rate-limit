@@ -287,3 +287,67 @@ async fn fleet_of_lease_managers_shares_one_valkey_bucket() {
         "fleet admitted {admitted} looks per-pod ({per_pod_would_be}), not shared via Valkey"
     );
 }
+
+#[tokio::test]
+async fn exact_gcra_against_valkey_enforces_and_never_over_admits() {
+    // Exact mode (GCRA) against real Valkey: emission interval honoured, burst
+    // respected, and — under concurrency — the atomic GCRA never admits more than
+    // burst back-to-back.
+    let Some(s) = store_or_skip().await else {
+        return;
+    };
+    let key = unique_key("gcra");
+    let now = 1_000_000u64;
+    // rate 4/s, burst 1 => allow one, deny the next, allow after 250ms.
+    assert!(
+        s.gcra_check(&key, 4.0, 1.0, 1.0, now, TTL_MS)
+            .await
+            .unwrap()
+            .allowed
+    );
+    let v = s
+        .gcra_check(&key, 4.0, 1.0, 1.0, now, TTL_MS)
+        .await
+        .unwrap();
+    assert!(!v.allowed);
+    assert!(
+        v.retry_after_ms > 0 && v.retry_after_ms <= 250,
+        "retry={}",
+        v.retry_after_ms
+    );
+    assert!(
+        s.gcra_check(&key, 4.0, 1.0, 1.0, now + 250, TTL_MS)
+            .await
+            .unwrap()
+            .allowed
+    );
+
+    // Concurrency: burst 10, 200 concurrent checks at the same instant admit at
+    // most 10 (the atomic GCRA can't be raced past its burst).
+    let s = Arc::new(s);
+    let ckey = unique_key("gcra-conc");
+    let admitted = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..200u64 {
+        let s = Arc::clone(&s);
+        let ckey = ckey.clone();
+        let a = Arc::clone(&admitted);
+        handles.push(tokio::spawn(async move {
+            if s.gcra_check(&ckey, 1.0, 10.0, 1.0, 2_000_000, TTL_MS)
+                .await
+                .unwrap()
+                .allowed
+            {
+                a.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    assert_eq!(
+        admitted.load(Ordering::Relaxed),
+        10,
+        "concurrent GCRA over-admitted past burst"
+    );
+}

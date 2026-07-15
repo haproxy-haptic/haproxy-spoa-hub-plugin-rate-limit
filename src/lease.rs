@@ -158,6 +158,56 @@ impl<S: Store> LeaseManager<S> {
         }
     }
 
+    /// Exact mode: a synchronous per-request GCRA check against the shared store
+    /// (for money/contract limits). This deliberately round-trips the store on
+    /// every request — the caller should `block_on` it. Unlike the approximate
+    /// path it **fails closed**: on a store error or an open breaker it denies,
+    /// because over-admitting a money limit is worse than a brief false deny.
+    pub async fn exact_check(&self, key: &str, rule: &Rule, now_ms: u64, now: Instant) -> Verdict {
+        let deny = || Verdict {
+            allowed: false,
+            limit: rule.limit as u32,
+            remaining: 0,
+            reset_s: rule.period_s.ceil().max(0.0) as u32,
+            retry_after_s: rule.period_s.ceil().max(1.0) as u32,
+        };
+        if !self.breaker.allow(now) {
+            return deny();
+        }
+        match self
+            .store
+            .gcra_check(
+                key,
+                rule.rate(),
+                rule.burst,
+                rule.cost,
+                now_ms,
+                self.config.ttl_ms,
+            )
+            .await
+        {
+            Ok(v) => {
+                self.breaker.on_success();
+                Verdict {
+                    allowed: v.allowed,
+                    limit: rule.limit as u32,
+                    remaining: 0,
+                    reset_s: rule.period_s.ceil().max(0.0) as u32,
+                    retry_after_s: if v.allowed {
+                        0
+                    } else {
+                        ((v.retry_after_ms as f64) / 1000.0).ceil().max(1.0) as u32
+                    },
+                }
+            }
+            Err(e) => {
+                log::warn!("ratelimit: exact check for {key} failed (fail-closed): {e}");
+                self.breaker.on_failure(now);
+                deny()
+            }
+        }
+    }
+
     fn upsert(&self, key: &str, rule: &Rule, now: Instant) -> (Arc<TokenBucket>, bool) {
         if let Some(e) = self
             .entries
@@ -308,6 +358,17 @@ mod tests {
                 _now: u64,
                 _ttl: u64,
             ) -> Result<crate::store::Reservation, crate::store::StoreError> {
+                Err(crate::store::StoreError::Connection("down".into()))
+            }
+            async fn gcra_check(
+                &self,
+                _k: &str,
+                _r: f64,
+                _b: f64,
+                _cost: f64,
+                _now: u64,
+                _ttl: u64,
+            ) -> Result<crate::store::GcraVerdict, crate::store::StoreError> {
                 Err(crate::store::StoreError::Connection("down".into()))
             }
         }

@@ -19,6 +19,14 @@ pub struct Reservation {
     pub remaining: f64,
 }
 
+/// The outcome of an exact (GCRA) per-request check.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GcraVerdict {
+    pub allowed: bool,
+    /// Milliseconds until a retry would be admitted, when denied.
+    pub retry_after_ms: u64,
+}
+
 /// A store failure. The lease manager treats any error as "store unavailable"
 /// and drives the circuit breaker; the local buckets keep enforcing their last
 /// lease (fail-static).
@@ -55,4 +63,17 @@ pub trait Store: Send + Sync {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<Reservation, StoreError>;
+
+    /// Exact per-request GCRA check (for `exact` mode / money limits). Unlike
+    /// `reserve`, this is called synchronously per request and round-trips the
+    /// store every time — the deliberate exactness/latency trade.
+    async fn gcra_check(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<GcraVerdict, StoreError>;
 }
