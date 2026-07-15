@@ -1,0 +1,24 @@
+[package]
+name = "rate-limit-plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+description = "Shared low-latency (local-first, lease-amortized) rate-limiting + quotas plugin for haproxy-spoa-hub"
+license = "Apache-2.0"
+repository = "https://gitlab.com/haproxy-haptic/haproxy-spoa-hub-plugin-ratelimit"
+
+[lib]
+# cdylib: the .so the hub dlopen's (librate_limit_plugin.so).
+# rlib: so unit tests + benches can link the crate.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+haproxy-spoa-hub-plugin-api = "0.7"
+log = "0.4"
+
+[dev-dependencies]
+# (integration/valkey tests add testcontainers behind a feature in a later phase)
+
+[profile.release]
+lto = true
+codegen-units = 1

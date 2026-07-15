@@ -1,0 +1,93 @@
+stages:
+  - check
+  - build
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+variables:
+  # renovate: datasource=docker depName=rust
+  RUST_VERSION: "1.94"
+  CARGO_INCREMENTAL: "0"
+  # dash->underscore of the "rate-limit" plugin key; must match LIB_NAMES in the
+  # chart's scripts/prep-spoa-plugins.sh and haptic.spoaHub.libName.
+  LIB_NAME: "librate_limit_plugin"
+
+.rules-code:
+  rules:
+    - changes:
+        - "**/*.rs"
+        - Cargo.toml
+        - Cargo.lock
+        - rustfmt.toml
+        - "tests/**/*"
+        - .gitlab-ci.yml
+
+# =============================================================================
+# Check stage — formatting, lints, tests. Skipped on tags (release pipeline
+# added with the first release, once the engine is chart-wired).
+# =============================================================================
+fmt:
+  stage: check
+  image: rust:${RUST_VERSION}-bookworm
+  tags: [saas-linux-small-amd64]
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - !reference [.rules-code, rules]
+  before_script:
+    - rustup component add rustfmt
+  script:
+    - cargo fmt -- --check
+
+clippy:
+  stage: check
+  image: rust:${RUST_VERSION}-bookworm
+  tags: [saas-linux-large-amd64]
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - !reference [.rules-code, rules]
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace --all-targets -- -D warnings
+
+test:
+  stage: check
+  image: rust:${RUST_VERSION}-bookworm
+  tags: [saas-linux-large-amd64]
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - !reference [.rules-code, rules]
+  script:
+    - cargo test --workspace
+
+# =============================================================================
+# Build stage — prove the cdylib links in CI (the real .so is produced by the
+# multi-arch release pipeline, added later).
+# =============================================================================
+build-release:
+  stage: build
+  image: rust:${RUST_VERSION}-bookworm
+  tags: [saas-linux-large-amd64]
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - !reference [.rules-code, rules]
+  script:
+    - cargo build --release
+    - test -f "target/release/${LIB_NAME}.so"
+  artifacts:
+    paths:
+      - "target/release/${LIB_NAME}.so"
+    expire_in: 1 week
