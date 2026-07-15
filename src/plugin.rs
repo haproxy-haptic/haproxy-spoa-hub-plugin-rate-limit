@@ -8,7 +8,7 @@
 //! on the low-water signal. The shared store (Valkey) is therefore touched only
 //! on that background path, never per request.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use haproxy_spoa_hub_plugin_api::{
@@ -27,11 +27,8 @@ use crate::store::memory::InMemoryStore;
 use crate::store::valkey::ValkeyStore;
 use crate::store::{Reservation, Store, StoreError};
 
-static CONFIG: OnceLock<PluginConfig> = OnceLock::new();
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-static MANAGER: OnceLock<std::sync::Arc<LeaseManager<AnyStore>>> = OnceLock::new();
-static PREFETCH: OnceLock<UnboundedSender<PrefetchReq>> = OnceLock::new();
 static METRICS: MetricRecorder = MetricRecorder::new();
+static STATE: RwLock<Option<PluginState>> = RwLock::new(None);
 
 /// Runtime store selection: shared Valkey, or per-pod in-process.
 enum AnyStore {
@@ -107,6 +104,26 @@ async fn background(
     }
 }
 
+struct PluginState {
+    config: PluginConfig,
+    runtime: Option<Runtime>,
+    manager: Arc<LeaseManager<AnyStore>>,
+    prefetch: Option<UnboundedSender<PrefetchReq>>,
+}
+
+impl Drop for PluginState {
+    fn drop(&mut self) {
+        // Close the prefetch channel first so the background loop can observe
+        // EOF and exit cleanly before the runtime is torn down. A plugin reload
+        // replaces this state under STATE's write lock after in-flight process()
+        // calls release their read locks.
+        self.prefetch.take();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::from_millis(100));
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RateLimitPlugin;
 
@@ -151,27 +168,20 @@ define_plugin!(RateLimitPlugin, {
             low_water: (config.low_water_percent as f64) / 100.0,
             ttl_ms: config.ttl_ms,
         };
-        let manager = std::sync::Arc::new(LeaseManager::new(
-            std::sync::Arc::new(store),
-            breaker,
-            lease_cfg,
-        ));
+        let manager = Arc::new(LeaseManager::new(Arc::new(store), breaker, lease_cfg));
 
         let (tx, rx) = mpsc::unbounded_channel();
         runtime.spawn(background(manager.clone(), rx, config.interval_ms));
 
-        MANAGER
-            .set(manager)
-            .map_err(|_| "manager already initialized")?;
-        PREFETCH
-            .set(tx)
-            .map_err(|_| "prefetch already initialized")?;
-        RUNTIME
-            .set(runtime)
-            .map_err(|_| "runtime already initialized")?;
-        CONFIG
-            .set(config)
-            .map_err(|_| "config already initialized")?;
+        let mut state = STATE
+            .write()
+            .map_err(|_| "plugin state lock poisoned during init")?;
+        *state = Some(PluginState {
+            config,
+            runtime: Some(runtime),
+            manager,
+            prefetch: Some(tx),
+        });
         Ok(())
     }
 
@@ -187,12 +197,12 @@ define_plugin!(RateLimitPlugin, {
         &self,
         message: &SpoeMessage,
     ) -> Result<ProcessingResult, Box<dyn std::error::Error + Send + Sync>> {
-        let config = CONFIG
-            .get()
-            .ok_or("plugin not initialized: config missing")?;
-        let manager = MANAGER
-            .get()
-            .ok_or("plugin not initialized: manager missing")?;
+        let state = STATE
+            .read()
+            .map_err(|_| "plugin state lock poisoned during process")?;
+        let state = state.as_ref().ok_or("plugin not initialized")?;
+        let config = &state.config;
+        let manager = &state.manager;
 
         let key = match message.get_string("key").filter(|s| !s.is_empty()) {
             Some(k) => k,
@@ -232,8 +242,9 @@ define_plugin!(RateLimitPlugin, {
             .get_string("mode")
             .is_some_and(|m| m.eq_ignore_ascii_case("exact"))
         {
-            let runtime = RUNTIME
-                .get()
+            let runtime = state
+                .runtime
+                .as_ref()
                 .ok_or("plugin not initialized: runtime missing")?;
             let verdict =
                 runtime.block_on(manager.exact_check(key, &rule, wall_ms(), Instant::now()));
@@ -254,7 +265,7 @@ define_plugin!(RateLimitPlugin, {
 
         let (verdict, needs_refresh) = manager.check(key, &rule, Instant::now());
         if needs_refresh {
-            if let Some(tx) = PREFETCH.get() {
+            if let Some(tx) = &state.prefetch {
                 // Unbounded, non-blocking: signal the background loop and move on.
                 let _ = tx.send(PrefetchReq {
                     key: key.to_string(),
@@ -332,4 +343,28 @@ fn build_result(v: &Verdict) -> ProcessingResult {
         SpoeValue::Uint32(v.retry_after_s),
     ));
     ProcessingResult { variables: vars }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use haproxy_spoa_hub_plugin_api::{PluginContext, RHashMap, RString};
+
+    fn test_context() -> PluginContext {
+        PluginContext {
+            name: RString::from("rate_limit"),
+            config: RHashMap::new(),
+        }
+    }
+
+    #[test]
+    fn init_can_run_for_multiple_plugin_generations_in_one_process() {
+        let ctx = test_context();
+
+        let mut first = RateLimitPlugin::__new();
+        first.__init(&ctx).expect("first plugin generation init");
+
+        let mut second = RateLimitPlugin::__new();
+        second.__init(&ctx).expect("second plugin generation init");
+    }
 }
