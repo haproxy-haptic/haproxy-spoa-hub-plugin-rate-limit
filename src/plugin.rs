@@ -69,6 +69,23 @@ impl DeferredValkeyStore {
         *guard = Some(Arc::clone(&store));
         Ok(store)
     }
+
+    async fn invalidate_if_current(&self, store: &Arc<ValkeyStore>) {
+        let stale = {
+            let mut guard = self.inner.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, store))
+            {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        if let Some(stale) = stale {
+            stale.shutdown().await;
+        }
+    }
 }
 
 impl Store for DeferredValkeyStore {
@@ -81,10 +98,17 @@ impl Store for DeferredValkeyStore {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<Reservation, StoreError> {
-        self.get()
-            .await?
+        let store = self.get().await?;
+        match store
             .reserve(key, rate, burst, requested, now_ms, ttl_ms)
             .await
+        {
+            Ok(reservation) => Ok(reservation),
+            Err(err) => {
+                self.invalidate_if_current(&store).await;
+                Err(err)
+            }
+        }
     }
 
     async fn gcra_check(
@@ -96,10 +120,17 @@ impl Store for DeferredValkeyStore {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<crate::store::GcraVerdict, StoreError> {
-        self.get()
-            .await?
+        let store = self.get().await?;
+        match store
             .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
             .await
+        {
+            Ok(verdict) => Ok(verdict),
+            Err(err) => {
+                self.invalidate_if_current(&store).await;
+                Err(err)
+            }
+        }
     }
 }
 
