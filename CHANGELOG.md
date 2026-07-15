@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-15
+
+### Fixed
+
+- Warm the shared Valkey connection in the background when `store_url` is
+  configured, preventing exact/GCRA mode from repeatedly failing closed while
+  paying connection setup on the request path.
+
 ## [0.1.2] - 2026-07-15
 
 ### Added

@@ -2,11 +2,12 @@
 //! locally via the lease manager, write the verdict, and signal an async lease
 //! refresh when needed.
 //!
-//! `process(&self, ...)` is synchronous and in-memory (the lease manager's local
-//! pool). A dedicated tokio runtime, spawned in `init`, runs the background
-//! refresh loop — a periodic tick (`refresh_all`) plus a prefetch channel drained
-//! on the low-water signal. The shared store (Valkey) is therefore touched only
-//! on that background path, never per request.
+//! `process(&self, ...)` is synchronous and in-memory for the default lease mode
+//! (the lease manager's local pool). A dedicated tokio runtime, spawned in
+//! `init`, runs the background refresh loop — a periodic tick (`refresh_all`)
+//! plus a prefetch channel drained on the low-water signal. Exact/GCRA mode is
+//! the deliberate exception: it synchronously checks the shared store per
+//! request, so the Valkey connection is warmed in the background at startup.
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,14 +35,15 @@ static STATE: RwLock<Option<PluginState>> = RwLock::new(None);
 
 /// Runtime store selection: shared Valkey, or per-pod in-process.
 enum AnyStore {
-    Valkey(DeferredValkeyStore),
+    Valkey(Arc<DeferredValkeyStore>),
     Memory(InMemoryStore),
 }
 
-/// Lazily connects to Valkey and reconnects after startup/DNS/store outages.
+/// Connects to Valkey on demand and reconnects after startup/DNS/store outages.
 /// Plugin initialization must not fail permanently just because the chart-owned
-/// store Service has not been applied yet; the first refresh/exact check will
-/// connect when the store is reachable.
+/// store Service has not been applied yet. A background warm-connect loop hides
+/// normal startup ordering from the exact-mode request path once the store is
+/// reachable.
 struct DeferredValkeyStore {
     url: String,
     inner: AsyncMutex<Option<Arc<ValkeyStore>>>,
@@ -56,14 +58,11 @@ impl DeferredValkeyStore {
     }
 
     async fn get(&self) -> Result<Arc<ValkeyStore>, StoreError> {
-        if let Some(store) = self.inner.lock().await.as_ref().cloned() {
+        let mut guard = self.inner.lock().await;
+        if let Some(store) = guard.as_ref().cloned() {
             return Ok(store);
         }
         let store = Arc::new(ValkeyStore::connect(&self.url).await?);
-        let mut guard = self.inner.lock().await;
-        if let Some(existing) = guard.as_ref().cloned() {
-            return Ok(existing);
-        }
         *guard = Some(Arc::clone(&store));
         Ok(store)
     }
@@ -136,6 +135,24 @@ impl Store for AnyStore {
 struct PrefetchReq {
     key: String,
     now_ms: u64,
+}
+
+async fn warm_valkey_connection(store: Arc<DeferredValkeyStore>) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(200));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        match store.get().await {
+            Ok(_) => {
+                log::info!("ratelimit: shared store connection ready");
+                return;
+            }
+            Err(e) => {
+                log::debug!("ratelimit: shared store connection not ready yet: {e}");
+            }
+        }
+        ticker.tick().await;
+    }
 }
 
 fn wall_ms() -> u64 {
@@ -213,8 +230,10 @@ define_plugin!(RateLimitPlugin, {
 
         let store = match &config.store_url {
             Some(url) => {
-                log::info!("ratelimit: shared store configured at {url}; connecting lazily");
-                AnyStore::Valkey(DeferredValkeyStore::new(url.clone()))
+                log::info!("ratelimit: shared store configured at {url}; warming connection");
+                let store = Arc::new(DeferredValkeyStore::new(url.clone()));
+                runtime.spawn(warm_valkey_connection(Arc::clone(&store)));
+                AnyStore::Valkey(store)
             }
             None => {
                 log::info!("ratelimit: no store_url configured — using per-pod in-process store");
