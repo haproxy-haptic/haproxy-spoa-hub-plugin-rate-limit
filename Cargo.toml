@@ -15,9 +15,15 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 haproxy-spoa-hub-plugin-api = "0.7"
 log = "0.4"
+# Async Valkey/Redis client for the shared-tier lease allocator. The per-request
+# hot path stays synchronous + in-memory; fred is used only on the background
+# lease-refresh path (see the design). Pooling + cluster + EVALSHA support.
+fred = { version = "10", features = ["i-scripts", "sha-1"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [dev-dependencies]
-# (integration/valkey tests add testcontainers behind a feature in a later phase)
+# Acceptance tests (tests/valkey_acceptance.rs) run against a real Valkey; they
+# are gated on the VALKEY_URL env var (set by a services: valkey in CI).
 
 [profile.release]
 lto = true

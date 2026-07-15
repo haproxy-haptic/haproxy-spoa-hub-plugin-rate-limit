@@ -71,6 +71,25 @@ test:
   script:
     - cargo test --workspace
 
+# Acceptance tests against a REAL Valkey (the Lua reservation's atomicity etc.).
+# A services: Valkey provides the instance; VALKEY_URL points the tests at it.
+acceptance:
+  stage: check
+  image: rust:${RUST_VERSION}-bookworm
+  tags: [saas-linux-large-amd64]
+  services:
+    - name: valkey/valkey:8
+      alias: valkey
+  variables:
+    VALKEY_URL: "redis://valkey:6379"
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - !reference [.rules-code, rules]
+  script:
+    - cargo test --test valkey_acceptance
+
 # =============================================================================
 # Build stage — prove the cdylib links in CI (the real .so is produced by the
 # multi-arch release pipeline, added later).

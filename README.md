@@ -27,12 +27,21 @@ Under active development. Implemented so far:
 
 - **Phase 1 — local enforcement core.** The per-request hot path: a lazy-refill
   token bucket (`src/bucket.rs`), the per-key limiter (`src/limiter.rs`), rule
-  parsing (`src/rule.rs`), and the SPOE `process()` glue (`src/plugin.rs`). No
-  Valkey yet — single-instance semantics prove the round-trip and the bucket.
+  parsing (`src/rule.rs`), and the SPOE `process()` glue (`src/plugin.rs`).
+- **Circuit breaker** (`src/breaker.rs`, fail-static) + **L1 negative cache**
+  (`src/negcache.rs`) — the resilience/short-circuit components.
+- **Shared-tier Valkey store** (`src/store/`) — the atomic single-key Lua
+  reservation (`reserve.lua`), the budget allocator the lease manager talks to.
 
-Next: the Valkey lease manager + circuit breaker + negative cache (Phase 2), chart
-wiring + cross-pod e2e (Phase 3), quotas + exact mode + high-cardinality CMS
-(Phase 4).
+**Tested:** 33 in-process tests incl. a thorough rate-limiting correctness suite
+(`tests/algorithm_correctness.rs`: windowed safety, sustained rate, burst,
+recovery, cost, concurrency/no-double-spend), plus **acceptance tests against a
+real Valkey** (`tests/valkey_acceptance.rs`, incl. the Lua reservation's
+atomicity under 500-way concurrency).
+
+Next: the lease manager (time-based leasing + async low-water prefetch, wiring the
+store into the local buckets), then chart wiring + cross-pod e2e (Phase 3), quotas
++ exact GCRA + high-cardinality CMS (Phase 4).
 
 ## SPOE contract
 

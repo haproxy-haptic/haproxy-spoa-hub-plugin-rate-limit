@@ -18,5 +18,6 @@ pub mod config;
 pub mod limiter;
 pub mod negcache;
 pub mod rule;
+pub mod store;
 
 mod plugin;
