@@ -8,11 +8,13 @@ pub struct PluginConfig {
     /// — a rate limiter must not become an outage. Money limits fail closed
     /// per-rule (Phase 4).
     pub fail_open: bool,
-    /// Valkey/Redis URL for the shared budget allocator (e.g.
-    /// `redis://valkey:6379`). When unset, the plugin uses an in-process store —
-    /// limits are then per-pod, like the stick-table fallback but through the
-    /// plugin path.
-    pub store_url: Option<String>,
+    /// Valkey/Redis URLs for the shared budget allocator. A single URL uses
+    /// one store; multiple URLs shard keys across independent stores with a
+    /// stable hash. URLs may point at plain Redis/Valkey, Sentinel, or any
+    /// topology supported by fred's URL parser. When unset, the plugin uses an
+    /// in-process store — limits are then per-pod, like the stick-table
+    /// fallback but through the plugin path.
+    pub store_urls: Vec<String>,
     /// Lease refresh interval T (ms). Store work is bounded by active keys and
     /// refresh cadence rather than raw request RPS.
     pub interval_ms: u64,
@@ -49,16 +51,30 @@ impl PluginConfig {
                 .unwrap_or(d)
         };
 
-        let store_url = context
-            .get_config("store_url")
-            .and_then(|v| v.as_str())
+        let mut store_urls: Vec<String> = context
+            .get_config("store_urls")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(String::from);
+            .map(String::from)
+            .collect();
+
+        if store_urls.is_empty() {
+            store_urls = context
+                .get_config("store_url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| vec![String::from(s)])
+                .unwrap_or_default();
+        }
 
         Ok(PluginConfig {
             fail_open: get_bool("fail_open", true),
-            store_url,
+            store_urls,
             interval_ms: get_u64("sync_interval_ms", 200, 1, 60_000),
             low_water_percent: get_u64("low_water_percent", 20, 0, 100),
             ttl_ms: get_u64("ttl_ms", 60_000, 1, 3_600_000),
@@ -76,7 +92,8 @@ impl PluginConfig {
   "type": "object",
   "properties": {
     "fail_open": { "type": "boolean" },
-    "store_url": { "type": "string", "description": "Valkey/Redis URL; unset = per-pod in-process store" },
+    "store_url": { "type": "string", "description": "Single Valkey/Redis URL; unset with no store_urls = per-pod in-process store" },
+    "store_urls": { "type": "array", "items": { "type": "string" }, "description": "Valkey/Redis URLs; keys are sharded across entries with a stable hash" },
     "sync_interval_ms": { "type": "integer", "minimum": 1 },
     "low_water_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
     "ttl_ms": { "type": "integer", "minimum": 1 },

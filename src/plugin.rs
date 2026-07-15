@@ -5,9 +5,12 @@
 //! `process(&self, ...)` is synchronous and in-memory for the default lease mode
 //! (the lease manager's local pool). A dedicated tokio runtime, spawned in
 //! `init`, runs the background refresh loop — a periodic tick (`refresh_all`)
-//! plus a prefetch channel drained on the low-water signal. Exact/GCRA mode is
-//! the deliberate exception: it synchronously checks the shared store per
-//! request, so the Valkey connection is warmed in the background at startup.
+//! plus a prefetch channel drained on the low-water signal. The shared store can
+//! be sharded across multiple Valkey/Redis/Sentinel endpoints; a stable hash
+//! maps each rate-limit key to one shard. Exact/GCRA mode is the deliberate
+//! exception: it synchronously checks the selected shared-store shard per
+//! request, so all configured Valkey connections are warmed in the background at
+//! startup.
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,7 +38,7 @@ static STATE: RwLock<Option<PluginState>> = RwLock::new(None);
 
 /// Runtime store selection: shared Valkey, or per-pod in-process.
 enum AnyStore {
-    Valkey(Arc<DeferredValkeyStore>),
+    Valkey(Arc<ShardedValkeyStore>),
     Memory(InMemoryStore),
 }
 
@@ -100,6 +103,62 @@ impl Store for DeferredValkeyStore {
     }
 }
 
+struct ShardedValkeyStore {
+    shards: Vec<Arc<DeferredValkeyStore>>,
+}
+
+impl ShardedValkeyStore {
+    fn new(urls: &[String]) -> Self {
+        Self {
+            shards: urls
+                .iter()
+                .cloned()
+                .map(DeferredValkeyStore::new)
+                .map(Arc::new)
+                .collect(),
+        }
+    }
+
+    fn shard(&self, key: &str) -> &DeferredValkeyStore {
+        let idx = (stable_hash64(key.as_bytes()) as usize) % self.shards.len();
+        &self.shards[idx]
+    }
+
+    fn shards(&self) -> impl Iterator<Item = Arc<DeferredValkeyStore>> + '_ {
+        self.shards.iter().cloned()
+    }
+}
+
+impl Store for ShardedValkeyStore {
+    async fn reserve(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        requested: f64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Reservation, StoreError> {
+        self.shard(key)
+            .reserve(key, rate, burst, requested, now_ms, ttl_ms)
+            .await
+    }
+
+    async fn gcra_check(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<crate::store::GcraVerdict, StoreError> {
+        self.shard(key)
+            .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
+            .await
+    }
+}
+
 impl Store for AnyStore {
     async fn reserve(
         &self,
@@ -130,6 +189,17 @@ impl Store for AnyStore {
             AnyStore::Memory(s) => s.gcra_check(key, rate, burst, cost, now_ms, ttl_ms).await,
         }
     }
+}
+
+fn stable_hash64(bytes: &[u8]) -> u64 {
+    // FNV-1a: small, deterministic across processes/languages, and sufficient
+    // for spreading arbitrary limiter keys across a small set of store shards.
+    let mut h = 0xcbf29ce484222325u64;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 struct PrefetchReq {
@@ -228,17 +298,19 @@ define_plugin!(RateLimitPlugin, {
             .enable_all()
             .build()?;
 
-        let store = match &config.store_url {
-            Some(url) => {
-                log::info!("ratelimit: shared store configured at {url}; warming connection");
-                let store = Arc::new(DeferredValkeyStore::new(url.clone()));
-                runtime.spawn(warm_valkey_connection(Arc::clone(&store)));
-                AnyStore::Valkey(store)
+        let store = if config.store_urls.is_empty() {
+            log::info!("ratelimit: no store_url(s) configured — using per-pod in-process store");
+            AnyStore::Memory(InMemoryStore::new())
+        } else {
+            log::info!(
+                "ratelimit: {} shared store shard(s) configured; warming connections",
+                config.store_urls.len()
+            );
+            let store = Arc::new(ShardedValkeyStore::new(&config.store_urls));
+            for shard in store.shards() {
+                runtime.spawn(warm_valkey_connection(shard));
             }
-            None => {
-                log::info!("ratelimit: no store_url configured — using per-pod in-process store");
-                AnyStore::Memory(InMemoryStore::new())
-            }
+            AnyStore::Valkey(store)
         };
 
         let breaker = CircuitBreaker::new(
@@ -461,5 +533,13 @@ mod tests {
 
         let mut second = RateLimitPlugin::__new();
         second.__init(&ctx).expect("second plugin generation init");
+    }
+
+    #[test]
+    fn stable_hash_has_known_value() {
+        assert_eq!(
+            stable_hash64(b"default/ingress|127.0.0.1"),
+            7262911014780214683
+        );
     }
 }

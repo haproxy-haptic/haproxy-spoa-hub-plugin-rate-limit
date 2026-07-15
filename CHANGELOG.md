@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-15
+
+### Added
+
+- Add `store_urls` for stable key sharding across multiple Valkey/Redis
+  endpoints, while keeping `store_url` backward-compatible.
+- Enable Sentinel URL support in the Valkey client so chart-managed or BYO
+  Sentinel-backed stores can fail over automatically.
+
 ## [0.1.3] - 2026-07-15
 
 ### Fixed
