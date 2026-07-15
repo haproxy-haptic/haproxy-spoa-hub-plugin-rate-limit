@@ -60,14 +60,29 @@ impl DeferredValkeyStore {
         }
     }
 
-    async fn get(&self) -> Result<Arc<ValkeyStore>, StoreError> {
+    async fn get_connected(&self) -> Result<Arc<ValkeyStore>, StoreError> {
+        let guard = self.inner.lock().await;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| StoreError::Connection("shared store is not connected yet".into()))
+    }
+
+    async fn connect_if_needed(&self) -> Result<(), StoreError> {
         let mut guard = self.inner.lock().await;
-        if let Some(store) = guard.as_ref().cloned() {
-            return Ok(store);
+        if guard.is_some() {
+            return Ok(());
         }
         let store = Arc::new(ValkeyStore::connect(&self.url).await?);
-        *guard = Some(Arc::clone(&store));
-        Ok(store)
+        *guard = Some(store);
+        Ok(())
+    }
+
+    async fn invalidate(&self) {
+        let stale = self.inner.lock().await.take();
+        if let Some(stale) = stale {
+            stale.shutdown().await;
+        }
     }
 
     async fn invalidate_if_current(&self, store: &Arc<ValkeyStore>) {
@@ -98,7 +113,7 @@ impl Store for DeferredValkeyStore {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<Reservation, StoreError> {
-        let store = self.get().await?;
+        let store = self.get_connected().await?;
         match store
             .reserve(key, rate, burst, requested, now_ms, ttl_ms)
             .await
@@ -120,7 +135,7 @@ impl Store for DeferredValkeyStore {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<crate::store::GcraVerdict, StoreError> {
-        let store = self.get().await?;
+        let store = self.get_connected().await?;
         match store
             .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
             .await
@@ -131,6 +146,10 @@ impl Store for DeferredValkeyStore {
                 Err(err)
             }
         }
+    }
+
+    async fn mark_unhealthy(&self, _key: &str) {
+        self.invalidate().await;
     }
 }
 
@@ -188,6 +207,10 @@ impl Store for ShardedValkeyStore {
             .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
             .await
     }
+
+    async fn mark_unhealthy(&self, key: &str) {
+        self.shard(key).invalidate().await;
+    }
 }
 
 impl Store for AnyStore {
@@ -220,6 +243,13 @@ impl Store for AnyStore {
             AnyStore::Memory(s) => s.gcra_check(key, rate, burst, cost, now_ms, ttl_ms).await,
         }
     }
+
+    async fn mark_unhealthy(&self, key: &str) {
+        match self {
+            AnyStore::Valkey(s) => s.mark_unhealthy(key).await,
+            AnyStore::Memory(s) => s.mark_unhealthy(key).await,
+        }
+    }
 }
 
 fn stable_hash64(bytes: &[u8]) -> u64 {
@@ -241,14 +271,18 @@ struct PrefetchReq {
 async fn warm_valkey_connection(store: Arc<DeferredValkeyStore>) {
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut logged_ready = false;
 
     loop {
-        match store.get().await {
+        match store.connect_if_needed().await {
             Ok(_) => {
-                log::info!("ratelimit: shared store connection ready");
-                return;
+                if !logged_ready {
+                    log::info!("ratelimit: shared store connection ready");
+                    logged_ready = true;
+                }
             }
             Err(e) => {
+                logged_ready = false;
                 log::debug!("ratelimit: shared store connection not ready yet: {e}");
             }
         }

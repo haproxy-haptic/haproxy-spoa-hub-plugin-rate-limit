@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-15
+
+### Fixed
+
+- Keep Valkey/Sentinel warm-reconnect tasks alive after the initial connection
+  and mark timed-out shards unhealthy, so exact/GCRA checks recover after a
+  Sentinel failover without performing reconnects inside the request timeout.
+
 ## [0.1.5] - 2026-07-15
 
 ### Fixed

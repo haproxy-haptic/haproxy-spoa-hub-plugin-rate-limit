@@ -228,6 +228,7 @@ impl<S: Store> LeaseManager<S> {
                 self.breaker.on_failure(now);
             }
             Err(_) => {
+                self.store.mark_unhealthy(key).await;
                 log::warn!(
                     "ratelimit: lease refresh for {key} timed out after {}ms (fail-static)",
                     self.config.store_timeout_ms
@@ -301,6 +302,7 @@ impl<S: Store> LeaseManager<S> {
                 deny()
             }
             Err(_) => {
+                self.store.mark_unhealthy(key).await;
                 log::warn!(
                     "ratelimit: exact check for {key} timed out after {}ms (fail-closed)",
                     self.config.store_timeout_ms
