@@ -10,7 +10,7 @@
 -- KEYS[1] = key
 -- ARGV[1] = rate   (tokens per second, float)
 -- ARGV[2] = burst  (max burst tokens, float)
--- ARGV[3] = now_ms (integer)
+-- ARGV[3] = now_ms (legacy caller clock, ignored; Valkey TIME is authoritative)
 -- ARGV[4] = cost   (float)
 -- ARGV[5] = ttl_ms (integer)
 --
@@ -18,9 +18,13 @@
 
 local rate  = tonumber(ARGV[1])
 local burst = tonumber(ARGV[2])
-local now   = tonumber(ARGV[3])
+local now_arg = tonumber(ARGV[3])
 local cost  = tonumber(ARGV[4])
 local ttl   = tonumber(ARGV[5])
+
+local time = redis.call('TIME')
+local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+if now == nil then now = now_arg end
 
 if rate <= 0 then
   -- A zero rate can never admit (avoid division by zero).

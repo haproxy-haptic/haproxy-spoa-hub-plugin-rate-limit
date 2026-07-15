@@ -10,7 +10,7 @@
 -- ARGV[1] = rate   (tokens per second, float)
 -- ARGV[2] = burst  (capacity, float)
 -- ARGV[3] = requested (tokens to reserve, float)
--- ARGV[4] = now_ms (integer, caller's clock)
+-- ARGV[4] = now_ms (legacy caller clock, ignored; Valkey TIME is authoritative)
 -- ARGV[5] = ttl_ms (integer, key expiry ~ one refill period)
 --
 -- Returns {granted, remaining} as strings (Redis truncates Lua numbers to
@@ -19,8 +19,12 @@
 local rate      = tonumber(ARGV[1])
 local burst     = tonumber(ARGV[2])
 local requested = tonumber(ARGV[3])
-local now       = tonumber(ARGV[4])
+local now_arg   = tonumber(ARGV[4])
 local ttl       = tonumber(ARGV[5])
+
+local time = redis.call('TIME')
+local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+if now == nil then now = now_arg end
 
 local data   = redis.call('HMGET', KEYS[1], 't', 'ts')
 local tokens = tonumber(data[1])

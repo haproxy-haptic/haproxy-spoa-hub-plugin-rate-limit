@@ -1,11 +1,12 @@
 //! Circuit breaker around the shared store (Valkey).
 //!
-//! The breaker is consulted by the **background** lease-refresh path, never by
-//! the per-request hot path. When Valkey starts failing it opens, so the lease
-//! manager stops calling a down store and the local buckets keep enforcing
-//! their last lease — this is the **fail-static** degradation. After a cooldown
-//! it half-opens and lets a single probe through; success closes it, failure
-//! re-opens it.
+//! The breaker is consulted by store-backed paths. In lease mode, that is the
+//! background refresh path: when Valkey starts failing it opens, so the lease
+//! manager stops calling a down store and local buckets keep enforcing their
+//! last lease — this is the **fail-static** degradation. In exact/GCRA mode,
+//! the per-request check also consults the breaker and fails closed while the
+//! store is unavailable. After a cooldown the breaker half-opens and lets a
+//! single probe through; success closes it, failure re-opens it.
 //!
 //! Classic three states:
 //! - **Closed** — healthy; lease refreshes proceed. Trips to Open after

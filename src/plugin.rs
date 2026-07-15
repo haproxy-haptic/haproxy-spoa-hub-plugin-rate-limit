@@ -15,7 +15,9 @@ use haproxy_spoa_hub_plugin_api::{
     MetricRecorder, ProcessingResult, RVec, SpoeValue, TxnVariable, define_plugin,
 };
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::time::MissedTickBehavior;
 
 use crate::breaker::CircuitBreaker;
@@ -32,8 +34,71 @@ static STATE: RwLock<Option<PluginState>> = RwLock::new(None);
 
 /// Runtime store selection: shared Valkey, or per-pod in-process.
 enum AnyStore {
-    Valkey(ValkeyStore),
+    Valkey(DeferredValkeyStore),
     Memory(InMemoryStore),
+}
+
+/// Lazily connects to Valkey and reconnects after startup/DNS/store outages.
+/// Plugin initialization must not fail permanently just because the chart-owned
+/// store Service has not been applied yet; the first refresh/exact check will
+/// connect when the store is reachable.
+struct DeferredValkeyStore {
+    url: String,
+    inner: AsyncMutex<Option<Arc<ValkeyStore>>>,
+}
+
+impl DeferredValkeyStore {
+    fn new(url: String) -> Self {
+        Self {
+            url,
+            inner: AsyncMutex::new(None),
+        }
+    }
+
+    async fn get(&self) -> Result<Arc<ValkeyStore>, StoreError> {
+        if let Some(store) = self.inner.lock().await.as_ref().cloned() {
+            return Ok(store);
+        }
+        let store = Arc::new(ValkeyStore::connect(&self.url).await?);
+        let mut guard = self.inner.lock().await;
+        if let Some(existing) = guard.as_ref().cloned() {
+            return Ok(existing);
+        }
+        *guard = Some(Arc::clone(&store));
+        Ok(store)
+    }
+}
+
+impl Store for DeferredValkeyStore {
+    async fn reserve(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        requested: f64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Reservation, StoreError> {
+        self.get()
+            .await?
+            .reserve(key, rate, burst, requested, now_ms, ttl_ms)
+            .await
+    }
+
+    async fn gcra_check(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<crate::store::GcraVerdict, StoreError> {
+        self.get()
+            .await?
+            .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
+            .await
+    }
 }
 
 impl Store for AnyStore {
@@ -84,7 +149,7 @@ fn wall_ms() -> u64 {
 /// plugin's tokio runtime for the process lifetime.
 async fn background(
     manager: std::sync::Arc<LeaseManager<AnyStore>>,
-    mut rx: UnboundedReceiver<PrefetchReq>,
+    mut rx: Receiver<PrefetchReq>,
     interval_ms: u64,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
@@ -108,7 +173,7 @@ struct PluginState {
     config: PluginConfig,
     runtime: Option<Runtime>,
     manager: Arc<LeaseManager<AnyStore>>,
-    prefetch: Option<UnboundedSender<PrefetchReq>>,
+    prefetch: Option<Sender<PrefetchReq>>,
 }
 
 impl Drop for PluginState {
@@ -147,11 +212,10 @@ define_plugin!(RateLimitPlugin, {
             .build()?;
 
         let store = match &config.store_url {
-            Some(url) => AnyStore::Valkey(
-                runtime
-                    .block_on(ValkeyStore::connect(url))
-                    .map_err(|e| format!("connect to store {url}: {e}"))?,
-            ),
+            Some(url) => {
+                log::info!("ratelimit: shared store configured at {url}; connecting lazily");
+                AnyStore::Valkey(DeferredValkeyStore::new(url.clone()))
+            }
             None => {
                 log::info!("ratelimit: no store_url configured — using per-pod in-process store");
                 AnyStore::Memory(InMemoryStore::new())
@@ -167,10 +231,13 @@ define_plugin!(RateLimitPlugin, {
             interval_ms: config.interval_ms,
             low_water: (config.low_water_percent as f64) / 100.0,
             ttl_ms: config.ttl_ms,
+            max_keys: config.max_keys,
+            idle_ttl_ms: config.idle_ttl_ms,
+            store_timeout_ms: config.store_timeout_ms,
         };
         let manager = Arc::new(LeaseManager::new(Arc::new(store), breaker, lease_cfg));
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(config.max_prefetch_queue);
         runtime.spawn(background(manager.clone(), rx, config.interval_ms));
 
         let mut state = STATE
@@ -266,11 +333,20 @@ define_plugin!(RateLimitPlugin, {
         let (verdict, needs_refresh) = manager.check(key, &rule, Instant::now());
         if needs_refresh {
             if let Some(tx) = &state.prefetch {
-                // Unbounded, non-blocking: signal the background loop and move on.
-                let _ = tx.send(PrefetchReq {
+                // Bounded, non-blocking: signal the background loop and move on.
+                // The lease manager coalesces per-key refreshes, so a full queue
+                // can safely drop this hint; the periodic refresh loop remains.
+                let req = PrefetchReq {
                     key: key.to_string(),
                     now_ms: wall_ms(),
-                });
+                };
+                if let Err(e) = tx.try_send(req) {
+                    let reason = match e {
+                        TrySendError::Full(_) => "full",
+                        TrySendError::Closed(_) => "closed",
+                    };
+                    METRICS.counter("ratelimit_prefetch_dropped_total", &[("reason", reason)], 1);
+                }
             }
         }
         METRICS.counter(

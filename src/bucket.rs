@@ -60,12 +60,20 @@ pub struct TokenBucket {
 impl TokenBucket {
     /// Create a bucket that starts full (`tokens == burst`).
     pub fn new(rate: f64, burst: f64, now: Instant) -> Self {
+        Self::new_with_tokens(rate, burst, burst, now)
+    }
+
+    /// Create a bucket with an explicit initial token count, clamped to
+    /// `[0, burst]`. Lease mode uses this to disable optimistic cold-starts
+    /// when local key cardinality is already at the configured cap.
+    pub fn new_with_tokens(rate: f64, burst: f64, tokens: f64, now: Instant) -> Self {
+        let burst = burst.max(0.0);
         Self {
             inner: Mutex::new(Inner {
-                tokens: burst,
+                tokens: tokens.max(0.0).min(burst),
                 last_refill: now,
                 rate: rate.max(0.0),
-                burst: burst.max(0.0),
+                burst,
             }),
         }
     }
