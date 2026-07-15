@@ -18,6 +18,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::time::{Duration, Instant};
+
+use rate_limit_plugin::breaker::CircuitBreaker;
+use rate_limit_plugin::lease::{LeaseConfig, LeaseManager};
+use rate_limit_plugin::rule::Rule;
 use rate_limit_plugin::store::Store;
 use rate_limit_plugin::store::valkey::ValkeyStore;
 
@@ -209,5 +214,76 @@ async fn distinct_keys_have_independent_global_buckets() {
             .unwrap()
             .granted,
         5.0
+    );
+}
+
+#[tokio::test]
+async fn fleet_of_lease_managers_shares_one_valkey_bucket() {
+    // The whole distributed model against REAL Valkey: N independent lease
+    // managers (each its own local pool) sharing ONE Valkey global bucket for the
+    // same key under a fleet-wide flood. Total admits must stay within the global
+    // capacity + N*batch (the fleet-shared bound), and be far below N*limit (the
+    // per-pod behaviour this replaces).
+    let Some(store) = store_or_skip().await else {
+        return;
+    };
+    let store = Arc::new(store);
+    let key = unique_key("fleet");
+    let n_pods = 6usize;
+    let interval_ms = 200u64;
+    let cfg = LeaseConfig {
+        interval_ms,
+        low_water: 0.2,
+        ttl_ms: TTL_MS,
+    };
+    let pods: Vec<_> = (0..n_pods)
+        .map(|_| {
+            LeaseManager::new(
+                Arc::clone(&store),
+                CircuitBreaker::new(3, Duration::from_secs(1), Instant::now()),
+                cfg,
+            )
+        })
+        .collect();
+
+    let rule = Rule {
+        limit: 50.0,
+        period_s: 1.0,
+        burst: 50.0,
+        cost: 1.0,
+    };
+    let base = Instant::now();
+    let duration_ms = 3_000u64;
+    // batch = rate*interval clamped to [1, burst] = 50*0.2 = 10.
+    let batch = (rule.limit / rule.period_s * (interval_ms as f64) / 1000.0)
+        .max(1.0)
+        .min(rule.burst);
+
+    let mut admitted = 0u64;
+    for ms in 0..=duration_ms {
+        let now = base + Duration::from_millis(ms);
+        for p in &pods {
+            let (v, refresh) = p.check(&key, &rule, now);
+            if v.allowed {
+                admitted += 1;
+            }
+            if refresh || ms % interval_ms == 0 {
+                p.refresh(&key, ms, now).await;
+            }
+        }
+    }
+
+    let global_cap = rule.burst + rule.limit / rule.period_s * (duration_ms as f64) / 1000.0;
+    let bound = (global_cap + (n_pods as f64) * batch).ceil() as u64 + n_pods as u64;
+    assert!(
+        admitted <= bound,
+        "fleet admitted {admitted} exceeded shared bound {bound} (global_cap {global_cap}, N*B {})",
+        n_pods as f64 * batch
+    );
+    let per_pod_would_be =
+        rule.limit / rule.period_s * (n_pods as f64) * (duration_ms as f64) / 1000.0;
+    assert!(
+        (admitted as f64) < per_pod_would_be * 0.6,
+        "fleet admitted {admitted} looks per-pod ({per_pod_would_be}), not shared via Valkey"
     );
 }

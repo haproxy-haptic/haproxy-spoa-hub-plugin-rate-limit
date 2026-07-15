@@ -5,6 +5,7 @@
 //! and the algorithm lives in the store (the Lua reservation for Valkey). This
 //! is consulted only on the *background* lease-refresh path, never per request.
 
+pub mod memory;
 pub mod valkey;
 
 use std::fmt;

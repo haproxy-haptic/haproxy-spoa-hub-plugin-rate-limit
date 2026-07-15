@@ -15,6 +15,7 @@
 pub mod breaker;
 pub mod bucket;
 pub mod config;
+pub mod lease;
 pub mod limiter;
 pub mod negcache;
 pub mod rule;

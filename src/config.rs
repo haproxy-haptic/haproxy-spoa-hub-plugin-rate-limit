@@ -1,39 +1,74 @@
 //! Plugin configuration, parsed from `[plugins.params]` in the hub TOML.
-//!
-//! Phase 1 exposes only `fail_open` (the store-unavailable policy). Phase 2 adds
-//! the Valkey address, the lease interval `T`, the per-pod batch `B`, and the
-//! per-key fail policy; the schema grows without breaking this surface.
 
 use haproxy_spoa_hub_plugin_api::PluginContext;
 
 #[derive(Debug, Clone)]
 pub struct PluginConfig {
-    /// When a rule can't be evaluated (Phase 2: the shared store is
-    /// unavailable), allow the request rather than block it. Default `true` —
-    /// a rate limiter must not become an outage. Money/quota limits override
-    /// to fail closed per-rule (Phase 4).
+    /// Allow the request when a rule can't be evaluated (bad rule). Default true
+    /// — a rate limiter must not become an outage. Money limits fail closed
+    /// per-rule (Phase 4).
     pub fail_open: bool,
+    /// Valkey/Redis URL for the shared budget allocator (e.g.
+    /// `redis://valkey:6379`). When unset, the plugin uses an in-process store —
+    /// limits are then per-pod, like the stick-table fallback but through the
+    /// plugin path.
+    pub store_url: Option<String>,
+    /// Lease refresh interval T (ms). Bounds store QPS to ~pods/T.
+    pub interval_ms: u64,
+    /// Low-water threshold as a percent of the batch (a request below it
+    /// triggers an async prefetch). Default 20.
+    pub low_water_percent: u64,
+    /// Store key TTL (ms).
+    pub ttl_ms: u64,
+    /// Circuit-breaker: consecutive failures before opening.
+    pub breaker_threshold: u32,
+    /// Circuit-breaker: open-state cooldown (ms) before a half-open probe.
+    pub breaker_cooldown_ms: u64,
 }
 
 impl PluginConfig {
     pub fn from_context(
         context: &PluginContext,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let fail_open = context
-            .get_config("fail_open")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        Ok(PluginConfig { fail_open })
+        let get_bool =
+            |k: &str, d: bool| context.get_config(k).and_then(|v| v.as_bool()).unwrap_or(d);
+        let get_u64 = |k: &str, d: u64, lo: i64, hi: i64| {
+            context
+                .get_config(k)
+                .and_then(|v| v.as_integer())
+                .map(|n| n.clamp(lo, hi) as u64)
+                .unwrap_or(d)
+        };
+
+        let store_url = context
+            .get_config("store_url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
+        Ok(PluginConfig {
+            fail_open: get_bool("fail_open", true),
+            store_url,
+            interval_ms: get_u64("sync_interval_ms", 200, 1, 60_000),
+            low_water_percent: get_u64("low_water_percent", 20, 0, 100),
+            ttl_ms: get_u64("ttl_ms", 60_000, 1, 3_600_000),
+            breaker_threshold: get_u64("breaker_threshold", 5, 1, 1_000) as u32,
+            breaker_cooldown_ms: get_u64("breaker_cooldown_ms", 5_000, 1, 600_000),
+        })
     }
 
     pub fn config_schema() -> &'static str {
         r#"{
   "type": "object",
   "properties": {
-    "fail_open": {
-      "type": "boolean",
-      "description": "Allow requests when a rule cannot be evaluated (default true)"
-    }
+    "fail_open": { "type": "boolean" },
+    "store_url": { "type": "string", "description": "Valkey/Redis URL; unset = per-pod in-process store" },
+    "sync_interval_ms": { "type": "integer", "minimum": 1 },
+    "low_water_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "ttl_ms": { "type": "integer", "minimum": 1 },
+    "breaker_threshold": { "type": "integer", "minimum": 1 },
+    "breaker_cooldown_ms": { "type": "integer", "minimum": 1 }
   }
 }"#
     }

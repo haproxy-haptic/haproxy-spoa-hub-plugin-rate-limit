@@ -110,6 +110,17 @@ impl TokenBucket {
         }
     }
 
+    /// Deposit leased tokens into the pool (from a shared-tier reservation),
+    /// capped at `burst`. Refills against the current rate up to `now` first.
+    /// Returns the resulting available tokens. This is how the lease manager
+    /// feeds a batch of globally-reserved tokens into the local bucket.
+    pub fn deposit(&self, tokens: f64, now: Instant) -> f64 {
+        let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        s.refill(now);
+        s.tokens = (s.tokens + tokens.max(0.0)).min(s.burst);
+        s.tokens
+    }
+
     /// Current available tokens (after a refill) — used for the low-water
     /// prefetch decision. Does not consume.
     pub fn available(&self, now: Instant) -> f64 {
