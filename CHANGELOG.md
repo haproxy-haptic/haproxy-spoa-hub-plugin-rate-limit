@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-15
+
+### Fixed
+
+- Plugin initialization is reload-safe: hub config reloads now replace the
+  plugin state instead of failing after the first generation with
+  `manager already initialized`.
+
 ## [0.1.0] - 2026-07-15
 
 ### Added
