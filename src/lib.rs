@@ -12,9 +12,11 @@
 //! cache on top without changing the hot-path shape.
 #![allow(non_camel_case_types, non_local_definitions)]
 
+pub mod breaker;
 pub mod bucket;
 pub mod config;
 pub mod limiter;
+pub mod negcache;
 pub mod rule;
 
 mod plugin;
