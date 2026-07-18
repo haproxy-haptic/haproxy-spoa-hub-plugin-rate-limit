@@ -5,11 +5,17 @@ against `haproxy-spoa-hub-plugin-api` (the `define_plugin!` vtable), edition 202
 
 ## Design invariant (do not regress)
 
-**Low latency is paramount: the shared store (Valkey) stays off the per-request
-hot path.** `plugin::process` → `limiter::check` → `bucket::TokenBucket::try_acquire`
-must remain in-memory only. Valkey is a background budget allocator (lease refresh
-timer + low-water prefetch), never a synchronous per-request call — except the
-opt-in `exact` mode. Full design + overshoot bounds: `specs/001-ratelimit-plugin/design.md`.
+**Low latency is paramount: the shared store (Valkey) stays off the steady-state
+hot path.** `plugin::process` → `lease::check` → `bucket::TokenBucket::try_acquire`
+must remain in-memory only for admitted traffic. Valkey is a background budget
+allocator (lease refresh timer + low-water prefetch) plus exactly two synchronous
+paths: the opt-in `exact` mode, and the bounded, per-key-coalesced
+**borrow-on-empty** escalation (v0.2.0) that runs ONLY when the local pool cannot
+cover a request — i.e. for requests that would otherwise be *wrongly denied*
+(an empty lease pool is not evidence the caller is over limit; `burst` lives in
+the store). Never add store I/O to the allowed-request path, and keep borrows
+coalesced + backoff-guarded so floods cannot turn into per-request store load.
+Full design + overshoot bounds: `specs/001-ratelimit-plugin/design.md`.
 
 ## Layout
 

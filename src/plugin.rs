@@ -390,6 +390,8 @@ define_plugin!(RateLimitPlugin, {
             max_keys: config.max_keys,
             idle_ttl_ms: config.idle_ttl_ms,
             store_timeout_ms: config.store_timeout_ms,
+            borrow_on_empty: config.borrow_on_empty,
+            fail_open: config.fail_open,
         };
         let manager = Arc::new(LeaseManager::new(Arc::new(store), breaker, lease_cfg));
 
@@ -505,6 +507,27 @@ define_plugin!(RateLimitPlugin, {
                 }
             }
         }
+
+        // Local pool exhausted: escalate to a bounded, coalesced borrow from
+        // the authoritative store before denying — this is what makes the
+        // rule's `burst` real for concurrent bursts (an empty local lease pool
+        // is not evidence the caller is over limit). Steady-state allowed
+        // traffic never reaches this path, keeping the store off the hot path.
+        if !verdict.allowed && config.borrow_on_empty {
+            let runtime = state
+                .runtime
+                .as_ref()
+                .ok_or("plugin not initialized: runtime missing")?;
+            let (borrow_verdict, outcome) =
+                runtime.block_on(manager.borrow_check(key, &rule, wall_ms(), Instant::now()));
+            METRICS.counter(
+                "ratelimit_requests_total",
+                &[("outcome", outcome.as_str())],
+                1,
+            );
+            return Ok(build_result(&borrow_verdict));
+        }
+
         METRICS.counter(
             "ratelimit_requests_total",
             &[(

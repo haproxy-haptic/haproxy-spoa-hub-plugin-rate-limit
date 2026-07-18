@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-18
+
+### Fixed
+
+- **Lease (token-bucket) mode now honors `burst`.** The local lease pool held
+  only `rate x sync_interval` tokens (4 for 1200/min at 200ms) with the
+  configured `burst` never reachable from the request path, so a browser page
+  load multiplexing ~60 requests over one connection was mass-denied while
+  hundreds of tokens sat unused in the store. An empty pool now escalates to a
+  single bounded, per-key-coalesced `reserve` against the authoritative store
+  bucket (borrow-on-empty) before denying — one store round-trip serves a whole
+  concurrent burst, and `burst` is exactly as real as the store's bucket.
+  Steady-state allowed traffic still never touches the store. Disable with
+  `borrow_on_empty = false` to restore the previous instant-deny behavior.
+- **`fail_open` is honored when the store is unreachable and the pool is
+  empty.** Previously a drained pool with an open circuit breaker denied
+  indefinitely regardless of `fail_open` ("fail-static" in name, fail-closed in
+  effect — observed during Sentinel failovers). The borrow path now resolves
+  breaker-open / store-error / timeout via `fail_open`. Background refresh
+  failures remain fail-static (the pool keeps serving its last lease).
+- **Honest rate-limit headers.** `remaining` now reports the budget the pod
+  knows about (local pool + store-side remaining at the last reservation)
+  instead of the tiny lease pool (the "frozen 3"), and `reset` counts down to
+  full replenishment instead of repeating `ceil(period)`.
+
+### Changed
+
+- Local pool capacity is the rule's `burst` (was one `rate x interval` batch),
+  so grants for a real burst fit locally; the optimistic cold-start fill is
+  unchanged (one batch), preserving the fleet overshoot bound.
+- Background lease refreshes are demand-sized (Doorman-style "wants"): a key's
+  observed per-interval demand — not just the static batch — sizes the next
+  lease, capped at `burst`, so recurring bursts are served from the local pool
+  with no borrow round-trips.
+- After a borrow proves the store bucket empty, further borrows for that key
+  back off for one sync interval: a sustained over-limit flood costs the store
+  at most one round-trip per interval per pod.
+
+### Added
+
+- `borrow_on_empty` config param (default `true`).
+- Per-outcome request metrics for the borrow path: `borrowed`,
+  `borrow_local_retry`, `borrow_coalesced`, `limited`, `limited_backoff`,
+  `borrow_fail_open`, `borrow_fail_closed`.
+
 ## [0.1.6] - 2026-07-15
 
 ### Fixed

@@ -35,6 +35,11 @@ pub struct PluginConfig {
     pub store_timeout_ms: u64,
     /// Bounded low-water prefetch queue size.
     pub max_prefetch_queue: usize,
+    /// When the local lease pool is empty, do one bounded, coalesced borrow
+    /// from the shared store before denying (makes the rule's `burst` real for
+    /// concurrent bursts). Default true; disable to restore pre-0.2
+    /// instant-deny behavior.
+    pub borrow_on_empty: bool,
 }
 
 impl PluginConfig {
@@ -84,6 +89,7 @@ impl PluginConfig {
             idle_ttl_ms: get_u64("idle_ttl_ms", 120_000, 1_000, 86_400_000),
             store_timeout_ms: get_u64("store_timeout_ms", 25, 1, 60_000),
             max_prefetch_queue: get_u64("max_prefetch_queue", 8_192, 1, 1_000_000) as usize,
+            borrow_on_empty: get_bool("borrow_on_empty", true),
         })
     }
 
@@ -102,7 +108,8 @@ impl PluginConfig {
     "max_keys": { "type": "integer", "minimum": 1 },
     "idle_ttl_ms": { "type": "integer", "minimum": 1000 },
     "store_timeout_ms": { "type": "integer", "minimum": 1 },
-    "max_prefetch_queue": { "type": "integer", "minimum": 1 }
+    "max_prefetch_queue": { "type": "integer", "minimum": 1 },
+    "borrow_on_empty": { "type": "boolean", "description": "Empty local pool escalates to one bounded store borrow before denying (burst correctness); default true" }
   }
 }"#
     }
