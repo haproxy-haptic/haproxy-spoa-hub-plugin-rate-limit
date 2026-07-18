@@ -350,3 +350,57 @@ async fn exact_gcra_against_valkey_enforces_and_never_over_admits() {
         "concurrent GCRA over-admitted past burst"
     );
 }
+
+/// v0.2.0 burst-correctness regression against the real store: the unifi
+/// incident shape. 60 concurrent requests on one cold key under
+/// `1200/min, burst 300` must ALL be admitted — the local lease pool holds
+/// only rate x interval = 4 tokens, so this exercises borrow-on-empty
+/// (coalesced synchronous reserve) against the authoritative Lua bucket.
+#[tokio::test]
+async fn browser_burst_is_fully_admitted_via_borrow_on_empty() {
+    let Some(s) = store_or_skip().await else {
+        return;
+    };
+    let m = Arc::new(LeaseManager::new(
+        Arc::new(s),
+        CircuitBreaker::new(3, Duration::from_secs(1), Instant::now()),
+        LeaseConfig::default(),
+    ));
+    let rule = Rule {
+        limit: 1200.0,
+        period_s: 60.0,
+        burst: 300.0,
+        cost: 1.0,
+    };
+    let key = unique_key("browser-burst");
+
+    let mut handles = Vec::new();
+    for _ in 0..60 {
+        let m = Arc::clone(&m);
+        let rule = rule.clone();
+        let key = key.clone();
+        handles.push(tokio::spawn(async move {
+            let now = Instant::now();
+            let (v, _) = m.check(&key, &rule, now);
+            if v.allowed {
+                return true;
+            }
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let (v, _) = m.borrow_check(&key, &rule, now_ms, now).await;
+            v.allowed
+        }));
+    }
+    let mut admitted = 0;
+    for h in handles {
+        if h.await.unwrap() {
+            admitted += 1;
+        }
+    }
+    assert_eq!(
+        admitted, 60,
+        "a 60-request page load must sail through burst 300 against real Valkey"
+    );
+}
