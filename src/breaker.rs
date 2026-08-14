@@ -3,9 +3,9 @@
 //! The breaker is consulted by store-backed paths. In lease mode, that is the
 //! background refresh path: when Valkey starts failing it opens, so the lease
 //! manager stops calling a down store and local buckets keep enforcing their
-//! last lease — this is the **fail-static** degradation. In exact/GCRA mode,
-//! the per-request check also consults the breaker and fails closed while the
-//! store is unavailable. After a cooldown the breaker half-opens and lets a
+//! last lease — this is the **fail-static** degradation. Exact/GCRA checks and
+//! empty-pool borrows resolve an open breaker through the configured local,
+//! open, or closed mode. After a cooldown the breaker half-opens and lets a
 //! single probe through; success closes it, failure re-opens it.
 //!
 //! Classic three states:

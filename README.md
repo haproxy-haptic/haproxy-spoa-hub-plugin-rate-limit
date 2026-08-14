@@ -22,9 +22,10 @@ within the shared store's grants. Under `max_keys` pressure, newly inserted keys
 created by capacity eviction start empty instead of optimistic, so
 high-cardinality traffic cannot mint fresh local tokens by cycling keys. A
 circuit breaker **fails static** (keeps enforcing the last local lease) through a
-store outage. An opt-in **exact mode** (synchronous GCRA per request) is
-available for low-volume money/contract limits and fails closed on store errors
-or store-operation timeouts. See
+store outage. An opt-in **exact mode** performs synchronous GCRA per request for
+low-volume limits that need fleet-exact accounting while the store is healthy.
+`store_failure_mode` selects a bounded per-sidecar fallback, unconditional
+allow, or deny when the store can't answer. See
 [`specs/001-ratelimit-plugin/design.md`](specs/001-ratelimit-plugin/design.md).
 
 ## Status
@@ -53,7 +54,58 @@ Next: quota/window algorithms and richer key derivation.
 
 Message `check-ratelimit`. Args in: `key`, `limit`, `period`, `burst`, `cost`,
 `mode`. Verdict out (`txn.hub.rate_limit.*`): `allowed` (bool), `limit`,
-`remaining`, `reset`, `retry_after`.
+`remaining`, `reset`, `retry_after`, `degraded` (bool), and `accounted` (bool).
+`degraded` is true only when store unavailability, rather than quota
+exhaustion, selected the verdict. `accounted` is true when authoritative or
+local fallback counters produced the verdict and rate-limit headers; it is
+false for untracked fail-open and synthetic fail-closed decisions. When it is
+false, the plugin omits `limit`, `remaining`, `reset`, and `retry_after`.
+
+## Store failure policy
+
+Set `store_failure_mode` in `[plugins.params]`:
+
+| Value | Store error, timeout, or open breaker |
+|---|---|
+| `local` | Enforce a per-sidecar emergency token bucket. |
+| `open` | Allow the request. |
+| `closed` | Deny the request. |
+
+The local emergency budget is shared by lease and exact checks for the same
+key. It starts with `burst` tokens on the first failed store decision, refills
+at the configured rate, and survives store recovery, so breaker flaps don't
+mint new bursts. Its registry is independently bounded by `max_keys`, in
+addition to the lease registry's `max_keys` bound; active debt is never evicted
+to admit a new key. If the emergency registry is full, `local` allows the
+untracked request and marks it degraded. Idle state is removed only after its
+budget has fully refilled.
+
+Setting `store_failure_mode` also disables the legacy unbacked optimistic lease
+for a new key. The first request either acquires store-backed tokens or resolves
+through the selected failure mode. Existing store-issued lease tokens remain
+available while the store is down. Omitting `store_failure_mode` retains the
+v0.2 cold-start behavior.
+
+`local` preserves per-sidecar service, not fleet-global exactness. During an
+outage of duration `D`, each sidecar can admit up to `burst + rate * D` from its
+emergency budget. Lease mode can also spend tokens granted before the outage.
+
+`invalid_rule_fail_open` controls malformed rules independently. For backward
+compatibility, omitting the new settings keeps the v0.2 behavior: `fail_open`
+controls invalid rules and lease borrow failures, while exact store failures
+deny. A deployment that wants local store fallback and strict rule parsing can
+use:
+
+```toml
+[plugins.params]
+store_failure_mode = "local"
+invalid_rule_fail_open = false
+```
+
+`ratelimit_requests_total{outcome=...}` distinguishes authoritative allowance
+and exhaustion from `exact_fallback_allowed`, `exact_fallback_limited`,
+`exact_fallback_capacity_open`, `exact_fail_open`, `exact_fail_closed`, and the
+corresponding `borrow_*` outcomes.
 
 ## Build & test
 

@@ -16,6 +16,10 @@ use crate::rule::Rule;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Verdict {
     pub allowed: bool,
+    /// The shared store could not answer and a configured fallback decided.
+    pub degraded: bool,
+    /// Whether rate-limit counters produced this verdict and its headers.
+    pub accounted: bool,
     pub limit: u32,
     pub remaining: u32,
     /// Seconds until the window resets (for `X-RateLimit-Reset`).
@@ -51,6 +55,8 @@ impl Limiter {
         let d = bucket.try_acquire(rule.cost, now);
         Verdict {
             allowed: d.allowed,
+            degraded: false,
+            accounted: true,
             limit: rule.limit as u32,
             remaining: d.remaining.floor().max(0.0) as u32,
             reset_s: rule.period_s.ceil().max(0.0) as u32,

@@ -49,6 +49,8 @@ Args HAPTIC sends (from per-app maps keyed on `txn.resource_id`): `key`, `limit`
 | var | HAProxy use |
 |-----|-------------|
 | `txn.hub.rate_limit.allowed` (bool) | `http-request deny deny_status 429 unless {...allowed -m bool}` |
+| `txn.hub.rate_limit.degraded` (bool) | dependency-failure logging and alerting |
+| `txn.hub.rate_limit.accounted` (bool) | budget fields are present only for authoritative or local counter verdicts |
 | `txn.hub.rate_limit.limit` / `.remaining` / `.reset` | `X-RateLimit-Limit`/`-Remaining`/`-Reset` |
 | `txn.hub.rate_limit.retry_after` | `Retry-After` on 429 |
 
@@ -116,7 +118,7 @@ demand-weighted rather than dividing by N.
 Valkey **FUNCTION** (portable `CL.THROTTLE` equivalent; avoids loadable C modules managed Valkey
 often forbids). Cost: a ~0.3 ms Valkey RTT on **every** request to that key — the exact latency the
 default eliminates — so exact mode is scoped to the specific keys that need it, never fleet-wide.
-Exact-mode breaker-open fails **closed**.
+Store errors, timeouts, and an open breaker resolve through `store_failure_mode`.
 
 ### L1 negative cache + circuit breaker
 
@@ -124,10 +126,24 @@ Exact-mode breaker-open fails **closed**.
   cache). First check on every request; short-circuits abusers with no Valkey hit. RESP3 `CLIENT
   TRACKING` (BCAST) push-invalidates `cfg:`/`block:` prefixes — server-pushed, not per-request GET.
   Never cache the live counter — only slow-changing config and window-stable verdicts.
-- **Circuit breaker** wraps every Valkey call. On outage it opens and each sidecar **fails static**:
-  keeps enforcing its last-known lease, degrading to `safe_capacity = limit / pod_count` per pod
-  (Doorman safe mode). Protective limits fail static/open; money limits fail closed. **No request
-  path starts depending on Valkey when the breaker is open.**
+- **Circuit breaker** wraps every Valkey call. On outage it opens and lease mode keeps enforcing its
+  last local grant. An empty lease pool or exact check then uses `store_failure_mode`: `local`
+  enforces a bounded per-sidecar emergency token bucket, `open` allows, and `closed` denies. The
+  emergency registry never evicts active debt; at capacity, `local` allows untracked traffic.
+  **No request path starts depending on Valkey when the breaker is open.**
+
+The emergency bucket is shared by lease and exact checks for one opaque key. It starts full on the
+first failed store decision, refills monotonically at the configured rate, and is not reset when the
+store recovers. Over an outage of duration `D`, one sidecar can admit at most `burst + rate * D`
+through this fallback; the fleet can admit that amount per sidecar, so exact mode is not fleet-exact
+while degraded. Lease mode can additionally spend grants obtained before the outage. Emergency
+state has its own `max_keys` bound alongside the lease registry and removes only idle, fully-refilled
+entries. If that bound prevents local accounting, `local` admits and reports degraded rather than
+turning state pressure into an outage.
+
+An explicit store failure policy disables the legacy optimistic cold lease. A new key must first
+obtain a store grant or resolve through that policy; already-issued lease tokens remain spendable.
+Omitting the new policy keeps the v0.2 cold-start behavior for compatibility.
 
 ### High-cardinality keyspaces (per-IP / per-API-key, millions of keys)
 
@@ -199,7 +215,7 @@ circuit breaker's fail-static keeps enforcement running through a store blip.
 | Stale pod_count corrupts fail-static safe-capacity during a scale event | conservative pod_count source; bias safe-capacity low |
 | Clock skew corrupts window-aligned accounting | monotonic elapsed time for refill; server-authoritative window timestamps |
 | High-cardinality blows sidecar/Valkey memory | lease only hot keys seen; CMS + optimistic-allow for the cold tail; approx top-k |
-| Fail-open wrong for money limits | per-key policy: protective → fail static/open; exact → fail closed |
+| Store outage posture differs by operator | `store_failure_mode` selects local, open, or closed independently of algorithm |
 | L1 neg-cache TTL too long keeps rejecting after abuse stops | TTL ≈ one sync interval, refreshed by CLIENT TRACKING push |
 
 ## 10. Phasing

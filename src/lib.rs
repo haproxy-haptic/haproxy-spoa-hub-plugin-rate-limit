@@ -12,6 +12,7 @@
 pub mod breaker;
 pub mod bucket;
 pub mod config;
+mod fallback;
 pub mod lease;
 pub mod limiter;
 pub mod negcache;

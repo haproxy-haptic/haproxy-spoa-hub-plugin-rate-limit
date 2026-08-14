@@ -19,7 +19,7 @@
 //! authoritative layering). A borrow that finds the store bucket empty is an
 //! honest over-limit deny and arms a one-interval backoff, bounding a flood's
 //! store cost to the refresh cadence. Store-unreachable borrows resolve via
-//! `fail_open`.
+//! the configured local, open, or closed failure mode.
 //!
 //! Each key's latest [`Rule`] is stored alongside its pool, so the background
 //! tick can refresh every active key without the caller re-supplying the rule.
@@ -41,6 +41,8 @@ use std::time::{Duration, Instant};
 
 use crate::breaker::CircuitBreaker;
 use crate::bucket::TokenBucket;
+use crate::config::StoreFailureMode;
+use crate::fallback::{FallbackDecision, FallbackLimiter};
 use crate::limiter::Verdict;
 use crate::rule::Rule;
 use crate::store::Store;
@@ -62,6 +64,12 @@ pub enum BorrowOutcome {
     FailOpen,
     /// Store unreachable, `fail_open=false`: denied.
     FailClosed,
+    /// Store unreachable: the per-sidecar fallback admitted the request.
+    FallbackAllowed,
+    /// Store unreachable: the per-sidecar fallback exhausted its budget.
+    FallbackLimited,
+    /// Store unreachable and the bounded local registry is full: admitted.
+    FallbackCapacityOpen,
 }
 
 impl BorrowOutcome {
@@ -75,8 +83,45 @@ impl BorrowOutcome {
             BorrowOutcome::Backoff => "limited_backoff",
             BorrowOutcome::FailOpen => "borrow_fail_open",
             BorrowOutcome::FailClosed => "borrow_fail_closed",
+            BorrowOutcome::FallbackAllowed => "borrow_fallback_allowed",
+            BorrowOutcome::FallbackLimited => "borrow_fallback_limited",
+            BorrowOutcome::FallbackCapacityOpen => "borrow_fallback_capacity_open",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactOutcome {
+    Allowed,
+    Limited,
+    FailOpen,
+    FailClosed,
+    FallbackAllowed,
+    FallbackLimited,
+    FallbackCapacityOpen,
+}
+
+impl ExactOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "exact_allowed",
+            Self::Limited => "exact_limited",
+            Self::FailOpen => "exact_fail_open",
+            Self::FailClosed => "exact_fail_closed",
+            Self::FallbackAllowed => "exact_fallback_allowed",
+            Self::FallbackLimited => "exact_fallback_limited",
+            Self::FallbackCapacityOpen => "exact_fallback_capacity_open",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreFailureResolution {
+    Open,
+    Closed,
+    FallbackAllowed,
+    FallbackLimited,
+    FallbackCapacityOpen,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,20 +139,21 @@ pub struct LeaseConfig {
     /// Drop local entries that have not been seen for this long. The Valkey key
     /// TTL handles global cleanup; this bounds per-sidecar state.
     pub idle_ttl_ms: u64,
-    /// Per-store-operation timeout. Exact mode relies on this being lower than
-    /// the hub/SPOE timeout so fail-closed verdicts reach HAProxy before the hub
-    /// drops the plugin result.
+    /// Per-store-operation timeout. This must be lower than the hub/SPOE
+    /// timeout so the selected fallback verdict reaches HAProxy.
     pub store_timeout_ms: u64,
     /// When the pool is empty, allow one bounded synchronous borrow from the
     /// shared store before denying (see [`LeaseManager::borrow_check`]). This is
     /// what makes the rule's `burst` real for concurrent bursts; disable to
     /// restore the pre-0.2 instant-deny behavior.
     pub borrow_on_empty: bool,
-    /// Verdict when the store is unreachable (breaker open / error / timeout)
-    /// AND the local pool cannot answer: `true` admits, `false` denies. Only the
-    /// borrow path consults this — background refresh failures remain
-    /// fail-static (the pool keeps serving its last lease).
-    pub fail_open: bool,
+    /// Preserve the pre-0.3 unbacked batch for configurations that do not set
+    /// an explicit store failure policy.
+    pub optimistic_cold_start: bool,
+    /// Store-unavailability policy after the local lease pool is empty.
+    pub borrow_failure_mode: StoreFailureMode,
+    /// Store-unavailability policy for synchronous exact checks.
+    pub exact_failure_mode: StoreFailureMode,
 }
 
 impl Default for LeaseConfig {
@@ -120,7 +166,9 @@ impl Default for LeaseConfig {
             idle_ttl_ms: 120_000,
             store_timeout_ms: 25,
             borrow_on_empty: true,
-            fail_open: true,
+            optimistic_cold_start: true,
+            borrow_failure_mode: StoreFailureMode::Open,
+            exact_failure_mode: StoreFailureMode::Closed,
         }
     }
 }
@@ -143,6 +191,9 @@ struct Entry {
     /// store at most one round-trip per refresh interval, preserving the
     /// amortization invariant even while over limit.
     borrow_backoff_until: Mutex<Option<Instant>>,
+    /// A failed borrow covers the whole coalesced waiter cohort. Waiters use
+    /// the configured fallback until this short backoff expires.
+    borrow_failure_until: Mutex<Option<Instant>>,
     /// Global tokens remaining as reported by the store at the last
     /// reservation (f64 bits). Feeds honest `remaining` headers instead of
     /// surfacing the tiny local pool.
@@ -168,6 +219,7 @@ impl Entry {
             demand: Mutex::new(0.0),
             borrow_gate: tokio::sync::Mutex::new(()),
             borrow_backoff_until: Mutex::new(None),
+            borrow_failure_until: Mutex::new(None),
             // Best guess before the first store contact: the full budget minus
             // the optimistic local fill.
             global_remaining: std::sync::atomic::AtomicU64::new(
@@ -221,6 +273,27 @@ impl Entry {
             .unwrap_or_else(|e| e.into_inner()) = Some(until);
     }
 
+    fn in_borrow_failure_backoff(&self, now: Instant) -> bool {
+        self.borrow_failure_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| now < until)
+    }
+
+    fn set_borrow_failure_backoff(&self, until: Instant) {
+        *self
+            .borrow_failure_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(until);
+    }
+
+    fn clear_borrow_failure_backoff(&self) {
+        *self
+            .borrow_failure_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     fn touch(&self, now: Instant) {
         *self.last_seen.lock().unwrap_or_else(|e| e.into_inner()) = now;
     }
@@ -267,6 +340,7 @@ pub struct LeaseManager<S: Store> {
     store: Arc<S>,
     breaker: CircuitBreaker,
     config: LeaseConfig,
+    fallback: FallbackLimiter,
 }
 
 impl<S: Store> LeaseManager<S> {
@@ -276,11 +350,14 @@ impl<S: Store> LeaseManager<S> {
         config.max_keys = config.max_keys.max(1);
         config.idle_ttl_ms = config.idle_ttl_ms.max(config.interval_ms);
         config.store_timeout_ms = config.store_timeout_ms.max(1);
+        let fallback =
+            FallbackLimiter::new(config.max_keys, Duration::from_millis(config.idle_ttl_ms));
         Self {
             entries: RwLock::new(HashMap::new()),
             store,
             breaker,
             config,
+            fallback,
         }
     }
 
@@ -327,6 +404,8 @@ impl<S: Store> LeaseManager<S> {
         };
         Verdict {
             allowed: d.allowed,
+            degraded: false,
+            accounted: true,
             limit: rule.limit as u32,
             remaining: known_remaining.floor().min(u32::MAX as f64) as u32,
             reset_s: reset_s.clamp(0.0, rule.period_s.ceil().max(1.0)) as u32,
@@ -338,6 +417,104 @@ impl<S: Store> LeaseManager<S> {
                 rule.period_s.ceil().max(1.0) as u32
             },
         }
+    }
+
+    fn fallback_verdict(rule: &Rule, decision: &crate::bucket::Decision) -> Verdict {
+        let reset_s = if rule.rate() > 0.0 {
+            ((rule.burst - decision.remaining).max(0.0) / rule.rate()).ceil()
+        } else {
+            rule.period_s.ceil()
+        };
+        Verdict {
+            allowed: decision.allowed,
+            degraded: true,
+            accounted: true,
+            limit: rule.limit as u32,
+            remaining: decision.remaining.floor().min(u32::MAX as f64) as u32,
+            reset_s: reset_s.clamp(0.0, rule.period_s.ceil().max(1.0)) as u32,
+            retry_after_s: if decision.allowed {
+                0
+            } else if decision.retry_after.is_finite() {
+                decision.retry_after.ceil().max(1.0) as u32
+            } else {
+                rule.period_s.ceil().max(1.0) as u32
+            },
+        }
+    }
+
+    fn resolve_store_failure(
+        &self,
+        mode: StoreFailureMode,
+        key: &str,
+        rule: &Rule,
+        now: Instant,
+        mut closed: Verdict,
+    ) -> (Verdict, StoreFailureResolution) {
+        closed.allowed = false;
+        closed.degraded = true;
+        closed.accounted = false;
+        closed.retry_after_s = 1;
+        match mode {
+            StoreFailureMode::Open => {
+                closed.allowed = true;
+                closed.retry_after_s = 0;
+                (closed, StoreFailureResolution::Open)
+            }
+            StoreFailureMode::Closed => (closed, StoreFailureResolution::Closed),
+            StoreFailureMode::Local => match self.fallback.check(key, rule, now) {
+                FallbackDecision::Available(decision) => (
+                    Self::fallback_verdict(rule, &decision),
+                    if decision.allowed {
+                        StoreFailureResolution::FallbackAllowed
+                    } else {
+                        StoreFailureResolution::FallbackLimited
+                    },
+                ),
+                FallbackDecision::Unavailable(_) => {
+                    closed.allowed = true;
+                    closed.retry_after_s = 0;
+                    (closed, StoreFailureResolution::FallbackCapacityOpen)
+                }
+            },
+        }
+    }
+
+    fn borrow_store_failure(
+        &self,
+        key: &str,
+        rule: &Rule,
+        now: Instant,
+        closed: Verdict,
+    ) -> (Verdict, BorrowOutcome) {
+        let (verdict, resolution) =
+            self.resolve_store_failure(self.config.borrow_failure_mode, key, rule, now, closed);
+        let outcome = match resolution {
+            StoreFailureResolution::Open => BorrowOutcome::FailOpen,
+            StoreFailureResolution::Closed => BorrowOutcome::FailClosed,
+            StoreFailureResolution::FallbackAllowed => BorrowOutcome::FallbackAllowed,
+            StoreFailureResolution::FallbackLimited => BorrowOutcome::FallbackLimited,
+            StoreFailureResolution::FallbackCapacityOpen => BorrowOutcome::FallbackCapacityOpen,
+        };
+        (verdict, outcome)
+    }
+
+    fn exact_store_failure(
+        &self,
+        key: &str,
+        rule: &Rule,
+        now: Instant,
+        closed: Verdict,
+    ) -> (Verdict, ExactOutcome) {
+        let (verdict, resolution) =
+            self.resolve_store_failure(self.config.exact_failure_mode, key, rule, now, closed);
+        let outcome = match resolution {
+            StoreFailureResolution::Open => ExactOutcome::FailOpen,
+            StoreFailureResolution::Closed => ExactOutcome::FailClosed,
+            StoreFailureResolution::FallbackAllowed => ExactOutcome::FallbackAllowed,
+            StoreFailureResolution::FallbackLimited => ExactOutcome::FallbackLimited,
+            StoreFailureResolution::FallbackCapacityOpen => ExactOutcome::FallbackCapacityOpen,
+        };
+        (verdict, outcome)
     }
 
     /// Background path: reserve the deficit for `key` (using its stored rule)
@@ -381,19 +558,19 @@ impl<S: Store> LeaseManager<S> {
                 self.breaker.on_success();
                 entry.set_global_remaining(res.remaining);
                 entry.bucket.deposit(res.granted, now);
+                entry.clear_borrow_failure_backoff();
                 entry.clear_refresh_pending();
             }
             Ok(Err(e)) => {
                 log::warn!("ratelimit: lease refresh for {key} failed (fail-static): {e}");
-                self.breaker.on_failure(now);
+                self.breaker.on_failure(Instant::now());
             }
             Err(_) => {
-                self.store.mark_unhealthy(key).await;
                 log::warn!(
                     "ratelimit: lease refresh for {key} timed out after {}ms (fail-static)",
                     self.config.store_timeout_ms
                 );
-                self.breaker.on_failure(now);
+                self.breaker.on_failure(Instant::now());
             }
         }
     }
@@ -401,6 +578,7 @@ impl<S: Store> LeaseManager<S> {
     /// Refresh every active key (the periodic tick).
     pub async fn refresh_all(&self, now_ms: u64, now: Instant) {
         self.sweep_idle(now);
+        self.fallback.sweep_idle(now);
         let keys: Vec<String> = self
             .entries
             .read()
@@ -425,8 +603,8 @@ impl<S: Store> LeaseManager<S> {
     ///  - store grants tokens → allow (the rule's `burst` is exactly as real
     ///    as the store's authoritative bucket),
     ///  - store answers "empty" → an honest deny (the caller IS over limit),
-    ///  - store unreachable (breaker open / error / timeout) → `fail_open`
-    ///    decides, fixing the silent fail-closed of drained pools.
+    ///  - store unreachable (breaker open / error / timeout) → the configured
+    ///    local, open, or closed failure mode decides.
     pub async fn borrow_check(
         &self,
         key: &str,
@@ -454,6 +632,10 @@ impl<S: Store> LeaseManager<S> {
                 BorrowOutcome::Backoff,
             );
         }
+        if entry.in_borrow_failure_backoff(now) {
+            let closed = Self::verdict_from_decision(rule, &d, entry.global_remaining());
+            return self.borrow_store_failure(key, rule, now, closed);
+        }
 
         // Coalesce: one leader per key does the store round-trip; waiters
         // re-check the pool the leader filled.
@@ -472,25 +654,15 @@ impl<S: Store> LeaseManager<S> {
                 BorrowOutcome::Backoff,
             );
         }
+        if entry.in_borrow_failure_backoff(now) {
+            let closed = Self::verdict_from_decision(rule, &d, entry.global_remaining());
+            return self.borrow_store_failure(key, rule, now, closed);
+        }
 
-        let fail_verdict = |allowed: bool, d: &crate::bucket::Decision| {
-            let mut v = Self::verdict_from_decision(rule, d, entry.global_remaining());
-            v.allowed = allowed;
-            if allowed {
-                v.retry_after_s = 0;
-            }
-            v
-        };
+        let closed = Self::verdict_from_decision(rule, &d, entry.global_remaining());
 
         if !self.breaker.allow(now) {
-            return (
-                fail_verdict(self.config.fail_open, &d),
-                if self.config.fail_open {
-                    BorrowOutcome::FailOpen
-                } else {
-                    BorrowOutcome::FailClosed
-                },
-            );
+            return self.borrow_store_failure(key, rule, now, closed);
         }
 
         // Ask for observed demand (at least the cost, at least one batch),
@@ -515,6 +687,7 @@ impl<S: Store> LeaseManager<S> {
         {
             Ok(Ok(res)) => {
                 self.breaker.on_success();
+                entry.clear_borrow_failure_backoff();
                 entry.set_global_remaining(res.remaining);
                 entry.bucket.deposit(res.granted, now);
                 let d = entry.bucket.try_acquire(rule.cost, now);
@@ -538,61 +711,52 @@ impl<S: Store> LeaseManager<S> {
             Ok(Err(e)) => {
                 log::warn!(
                     "ratelimit: borrow for {key} failed ({}): {e}",
-                    if self.config.fail_open {
-                        "fail-open"
-                    } else {
-                        "fail-closed"
-                    }
+                    self.config.borrow_failure_mode.as_str()
                 );
-                self.breaker.on_failure(now);
-                (
-                    fail_verdict(self.config.fail_open, &d),
-                    if self.config.fail_open {
-                        BorrowOutcome::FailOpen
-                    } else {
-                        BorrowOutcome::FailClosed
-                    },
-                )
+                let failure_now = Instant::now();
+                entry.set_borrow_failure_backoff(
+                    failure_now + Duration::from_millis(self.config.interval_ms),
+                );
+                self.breaker.on_failure(failure_now);
+                self.borrow_store_failure(key, rule, failure_now, closed)
             }
             Err(_) => {
-                self.store.mark_unhealthy(key).await;
                 log::warn!(
                     "ratelimit: borrow for {key} timed out after {}ms ({})",
                     self.config.store_timeout_ms,
-                    if self.config.fail_open {
-                        "fail-open"
-                    } else {
-                        "fail-closed"
-                    }
+                    self.config.borrow_failure_mode.as_str()
                 );
-                self.breaker.on_failure(now);
-                (
-                    fail_verdict(self.config.fail_open, &d),
-                    if self.config.fail_open {
-                        BorrowOutcome::FailOpen
-                    } else {
-                        BorrowOutcome::FailClosed
-                    },
-                )
+                let failure_now = Instant::now();
+                entry.set_borrow_failure_backoff(
+                    failure_now + Duration::from_millis(self.config.interval_ms),
+                );
+                self.breaker.on_failure(failure_now);
+                self.borrow_store_failure(key, rule, failure_now, closed)
             }
         }
     }
 
-    /// Exact mode: a synchronous per-request GCRA check against the shared store
-    /// (for money/contract limits). This deliberately round-trips the store on
-    /// every request — the caller should `block_on` it. Unlike the approximate
-    /// path it **fails closed**: on a store error or an open breaker it denies,
-    /// because over-admitting a money limit is worse than a brief false deny.
-    pub async fn exact_check(&self, key: &str, rule: &Rule, now_ms: u64, now: Instant) -> Verdict {
+    /// Exact mode: a synchronous per-request GCRA check against the shared
+    /// store. Store failures resolve through the configured failure mode;
+    /// local mode is a per-sidecar emergency budget, not fleet-exact GCRA.
+    pub async fn exact_check(
+        &self,
+        key: &str,
+        rule: &Rule,
+        now_ms: u64,
+        now: Instant,
+    ) -> (Verdict, ExactOutcome) {
         let deny = || Verdict {
             allowed: false,
+            degraded: false,
+            accounted: false,
             limit: rule.limit as u32,
             remaining: 0,
             reset_s: rule.period_s.ceil().max(0.0) as u32,
             retry_after_s: rule.period_s.ceil().max(1.0) as u32,
         };
         if !self.breaker.allow(now) {
-            return deny();
+            return self.exact_store_failure(key, rule, now, deny());
         }
         match tokio::time::timeout(
             Duration::from_millis(self.config.store_timeout_ms),
@@ -609,8 +773,10 @@ impl<S: Store> LeaseManager<S> {
         {
             Ok(Ok(v)) => {
                 self.breaker.on_success();
-                Verdict {
+                let verdict = Verdict {
                     allowed: v.allowed,
+                    degraded: false,
+                    accounted: true,
                     limit: rule.limit as u32,
                     remaining: 0,
                     reset_s: rule.period_s.ceil().max(0.0) as u32,
@@ -619,21 +785,32 @@ impl<S: Store> LeaseManager<S> {
                     } else {
                         ((v.retry_after_ms as f64) / 1000.0).ceil().max(1.0) as u32
                     },
-                }
+                };
+                let outcome = if verdict.allowed {
+                    ExactOutcome::Allowed
+                } else {
+                    ExactOutcome::Limited
+                };
+                (verdict, outcome)
             }
             Ok(Err(e)) => {
-                log::warn!("ratelimit: exact check for {key} failed (fail-closed): {e}");
-                self.breaker.on_failure(now);
-                deny()
+                log::warn!(
+                    "ratelimit: exact check for {key} failed ({}): {e}",
+                    self.config.exact_failure_mode.as_str()
+                );
+                let failure_now = Instant::now();
+                self.breaker.on_failure(failure_now);
+                self.exact_store_failure(key, rule, failure_now, deny())
             }
             Err(_) => {
-                self.store.mark_unhealthy(key).await;
                 log::warn!(
-                    "ratelimit: exact check for {key} timed out after {}ms (fail-closed)",
-                    self.config.store_timeout_ms
+                    "ratelimit: exact check for {key} timed out after {}ms ({})",
+                    self.config.store_timeout_ms,
+                    self.config.exact_failure_mode.as_str()
                 );
-                self.breaker.on_failure(now);
-                deny()
+                let failure_now = Instant::now();
+                self.breaker.on_failure(failure_now);
+                self.exact_store_failure(key, rule, failure_now, deny())
             }
         }
     }
@@ -662,7 +839,12 @@ impl<S: Store> LeaseManager<S> {
         }
 
         let evicted_for_capacity = self.evict_if_needed(&mut w, now);
-        let entry = Arc::new(Entry::new(rule, batch, !evicted_for_capacity, now));
+        let entry = Arc::new(Entry::new(
+            rule,
+            batch,
+            self.config.optimistic_cold_start && !evicted_for_capacity,
+            now,
+        ));
         w.insert(key.to_string(), entry.clone());
         (entry, true, false)
     }
@@ -1042,6 +1224,165 @@ mod tests {
         }
     }
 
+    struct DownStore;
+
+    impl Store for DownStore {
+        async fn reserve(
+            &self,
+            _k: &str,
+            _r: f64,
+            _b: f64,
+            _req: f64,
+            _now: u64,
+            _ttl: u64,
+        ) -> Result<crate::store::Reservation, crate::store::StoreError> {
+            Err(crate::store::StoreError::Connection("down".into()))
+        }
+
+        async fn gcra_check(
+            &self,
+            _k: &str,
+            _r: f64,
+            _b: f64,
+            _cost: f64,
+            _now: u64,
+            _ttl: u64,
+        ) -> Result<crate::store::GcraVerdict, crate::store::StoreError> {
+            Err(crate::store::StoreError::Connection("down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_closed_policy_denies_a_cold_key_when_the_store_is_down() {
+        let m = LeaseManager::new(
+            Arc::new(DownStore),
+            CircuitBreaker::new(100, Duration::from_secs(1), Instant::now()),
+            LeaseConfig {
+                optimistic_cold_start: false,
+                borrow_failure_mode: StoreFailureMode::Closed,
+                ..LeaseConfig::default()
+            },
+        );
+        let rule = Rule {
+            limit: 10.0,
+            period_s: 1.0,
+            burst: 10.0,
+            cost: 1.0,
+        };
+
+        let (verdict, outcome) = check_then_borrow(&m, "cold", &rule, 0, Instant::now()).await;
+        assert!(!verdict.allowed);
+        assert!(verdict.degraded);
+        assert!(!verdict.accounted);
+        assert_eq!(outcome, Some(BorrowOutcome::FailClosed));
+    }
+
+    #[tokio::test]
+    async fn explicit_local_policy_uses_fallback_for_a_cold_key() {
+        let m = LeaseManager::new(
+            Arc::new(DownStore),
+            CircuitBreaker::new(100, Duration::from_secs(1), Instant::now()),
+            LeaseConfig {
+                optimistic_cold_start: false,
+                borrow_failure_mode: StoreFailureMode::Local,
+                ..LeaseConfig::default()
+            },
+        );
+        let rule = Rule {
+            limit: 2.0,
+            period_s: 1.0,
+            burst: 2.0,
+            cost: 1.0,
+        };
+
+        let (verdict, outcome) = check_then_borrow(&m, "cold", &rule, 0, Instant::now()).await;
+        assert!(verdict.allowed);
+        assert!(verdict.degraded);
+        assert!(verdict.accounted);
+        assert_eq!(outcome, Some(BorrowOutcome::FallbackAllowed));
+    }
+
+    #[tokio::test]
+    async fn explicit_closed_policy_keeps_spending_store_backed_lease_tokens() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct ToggleLeaseStore {
+            down: AtomicBool,
+            inner: InMemoryStore,
+        }
+
+        impl Store for ToggleLeaseStore {
+            async fn reserve(
+                &self,
+                key: &str,
+                rate: f64,
+                burst: f64,
+                requested: f64,
+                now_ms: u64,
+                ttl_ms: u64,
+            ) -> Result<crate::store::Reservation, crate::store::StoreError> {
+                if self.down.load(AtomicOrdering::Acquire) {
+                    Err(crate::store::StoreError::Connection("down".into()))
+                } else {
+                    self.inner
+                        .reserve(key, rate, burst, requested, now_ms, ttl_ms)
+                        .await
+                }
+            }
+
+            async fn gcra_check(
+                &self,
+                _key: &str,
+                _rate: f64,
+                _burst: f64,
+                _cost: f64,
+                _now_ms: u64,
+                _ttl_ms: u64,
+            ) -> Result<crate::store::GcraVerdict, crate::store::StoreError> {
+                unreachable!()
+            }
+        }
+
+        let store = Arc::new(ToggleLeaseStore {
+            down: AtomicBool::new(false),
+            inner: InMemoryStore::new(),
+        });
+        let m = LeaseManager::new(
+            Arc::clone(&store),
+            CircuitBreaker::new(100, Duration::from_secs(1), Instant::now()),
+            LeaseConfig {
+                optimistic_cold_start: false,
+                borrow_failure_mode: StoreFailureMode::Closed,
+                ..LeaseConfig::default()
+            },
+        );
+        let rule = Rule {
+            limit: 10.0,
+            period_s: 1.0,
+            burst: 10.0,
+            cost: 1.0,
+        };
+        let now = Instant::now();
+
+        let (cold, _) = m.check("backed", &rule, now);
+        assert!(
+            !cold.allowed,
+            "explicit policy starts without unbacked tokens"
+        );
+        m.refresh("backed", 0, now).await;
+        store.down.store(true, AtomicOrdering::Release);
+
+        for _ in 0..2 {
+            let (leased, _) = m.check("backed", &rule, now);
+            assert!(leased.allowed, "store-issued lease remains spendable");
+            assert!(!leased.degraded);
+            assert!(leased.accounted);
+        }
+        let (closed, outcome) = check_then_borrow(&m, "backed", &rule, 0, now).await;
+        assert!(!closed.allowed);
+        assert_eq!(outcome, Some(BorrowOutcome::FailClosed));
+    }
+
     #[tokio::test]
     async fn store_timeouts_fail_static_for_lease_mode() {
         let m = LeaseManager::new(
@@ -1085,8 +1426,317 @@ mod tests {
             cost: 1.0,
         };
 
-        let v = m.exact_check("k", &rule, 0, Instant::now()).await;
+        let (v, outcome) = m.exact_check("k", &rule, 0, Instant::now()).await;
         assert!(!v.allowed, "exact mode must fail closed on store timeout");
+        assert!(v.degraded);
+        assert_eq!(outcome, ExactOutcome::FailClosed);
+    }
+
+    #[tokio::test]
+    async fn exact_store_failure_uses_bounded_local_budget() {
+        let m = LeaseManager::new(
+            Arc::new(DownStore),
+            CircuitBreaker::new(100, Duration::from_secs(1), Instant::now()),
+            LeaseConfig {
+                exact_failure_mode: StoreFailureMode::Local,
+                ..LeaseConfig::default()
+            },
+        );
+        let rule = Rule {
+            limit: 2.0,
+            period_s: 1.0,
+            burst: 2.0,
+            cost: 1.0,
+        };
+        let now = Instant::now();
+
+        for _ in 0..2 {
+            let (verdict, outcome) = m.exact_check("k", &rule, 0, now).await;
+            assert!(verdict.allowed);
+            assert!(verdict.degraded);
+            assert!(verdict.accounted);
+            assert_eq!(outcome, ExactOutcome::FallbackAllowed);
+        }
+        let (verdict, outcome) = m.exact_check("k", &rule, 0, now).await;
+        assert!(!verdict.allowed);
+        assert!(verdict.degraded);
+        assert!(verdict.accounted);
+        assert_eq!(verdict.retry_after_s, 1);
+        assert_eq!(outcome, ExactOutcome::FallbackLimited);
+    }
+
+    #[tokio::test]
+    async fn fallback_capacity_fails_open_without_evicting_existing_budget() {
+        let m = LeaseManager::new(
+            Arc::new(DownStore),
+            CircuitBreaker::new(100, Duration::from_secs(1), Instant::now()),
+            LeaseConfig {
+                max_keys: 1,
+                exact_failure_mode: StoreFailureMode::Local,
+                ..LeaseConfig::default()
+            },
+        );
+        let rule = Rule {
+            limit: 1.0,
+            period_s: 60.0,
+            burst: 1.0,
+            cost: 1.0,
+        };
+        let now = Instant::now();
+
+        let (_, first) = m.exact_check("tracked", &rule, 0, now).await;
+        assert_eq!(first, ExactOutcome::FallbackAllowed);
+        let (capacity_open, outcome) = m.exact_check("untracked", &rule, 0, now).await;
+        assert!(capacity_open.allowed);
+        assert!(capacity_open.degraded);
+        assert!(!capacity_open.accounted);
+        assert_eq!(outcome, ExactOutcome::FallbackCapacityOpen);
+        let (limited, outcome) = m.exact_check("tracked", &rule, 0, now).await;
+        assert!(!limited.allowed);
+        assert_eq!(outcome, ExactOutcome::FallbackLimited);
+    }
+
+    #[tokio::test]
+    async fn successful_store_checks_do_not_reset_emergency_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct ToggleStore(AtomicBool);
+        impl Store for ToggleStore {
+            async fn reserve(
+                &self,
+                _k: &str,
+                _r: f64,
+                _b: f64,
+                _req: f64,
+                _now: u64,
+                _ttl: u64,
+            ) -> Result<crate::store::Reservation, crate::store::StoreError> {
+                unreachable!()
+            }
+
+            async fn gcra_check(
+                &self,
+                _k: &str,
+                _r: f64,
+                _b: f64,
+                _cost: f64,
+                _now: u64,
+                _ttl: u64,
+            ) -> Result<crate::store::GcraVerdict, crate::store::StoreError> {
+                if self.0.load(AtomicOrdering::Acquire) {
+                    Ok(crate::store::GcraVerdict {
+                        allowed: true,
+                        retry_after_ms: 0,
+                    })
+                } else {
+                    Err(crate::store::StoreError::Connection("down".into()))
+                }
+            }
+        }
+
+        let store = Arc::new(ToggleStore(AtomicBool::new(false)));
+        let m = LeaseManager::new(
+            Arc::clone(&store),
+            CircuitBreaker::new(100, Duration::from_secs(1), Instant::now()),
+            LeaseConfig {
+                exact_failure_mode: StoreFailureMode::Local,
+                ..LeaseConfig::default()
+            },
+        );
+        let rule = Rule {
+            limit: 1.0,
+            period_s: 60.0,
+            burst: 1.0,
+            cost: 1.0,
+        };
+        let now = Instant::now();
+
+        let (_, first) = m.exact_check("k", &rule, 0, now).await;
+        assert_eq!(first, ExactOutcome::FallbackAllowed);
+        store.0.store(true, AtomicOrdering::Release);
+        let (_, healthy) = m.exact_check("k", &rule, 0, now).await;
+        assert_eq!(healthy, ExactOutcome::Allowed);
+        store.0.store(false, AtomicOrdering::Release);
+        let (limited, second_failure) = m.exact_check("k", &rule, 0, now).await;
+        assert!(!limited.allowed);
+        assert_eq!(second_failure, ExactOutcome::FallbackLimited);
+    }
+
+    #[tokio::test]
+    async fn request_fallback_stays_within_timeout_and_coalesces_waiters() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct TimeoutStore {
+            reserve_calls: AtomicUsize,
+        }
+        impl Store for TimeoutStore {
+            async fn reserve(
+                &self,
+                _k: &str,
+                _r: f64,
+                _b: f64,
+                _req: f64,
+                _now: u64,
+                _ttl: u64,
+            ) -> Result<crate::store::Reservation, crate::store::StoreError> {
+                self.reserve_calls.fetch_add(1, AtomicOrdering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                unreachable!()
+            }
+
+            async fn gcra_check(
+                &self,
+                _k: &str,
+                _r: f64,
+                _b: f64,
+                _cost: f64,
+                _now: u64,
+                _ttl: u64,
+            ) -> Result<crate::store::GcraVerdict, crate::store::StoreError> {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                unreachable!()
+            }
+        }
+
+        let store = Arc::new(TimeoutStore {
+            reserve_calls: AtomicUsize::new(0),
+        });
+        let m = Arc::new(LeaseManager::new(
+            Arc::clone(&store),
+            CircuitBreaker::new(100, Duration::from_secs(1), Instant::now()),
+            LeaseConfig {
+                store_timeout_ms: 10,
+                borrow_failure_mode: StoreFailureMode::Local,
+                exact_failure_mode: StoreFailureMode::Local,
+                ..LeaseConfig::default()
+            },
+        ));
+        let rule = Rule {
+            limit: 1.0,
+            period_s: 1.0,
+            burst: 1.0,
+            cost: 1.0,
+        };
+
+        let started = Instant::now();
+        let (exact, outcome) = m.exact_check("exact", &rule, 0, started).await;
+        assert!(exact.allowed);
+        assert_eq!(outcome, ExactOutcome::FallbackAllowed);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "exact fallback exceeded the request deadline"
+        );
+
+        let now = Instant::now();
+        let (optimistic, _) = m.check("lease", &rule, now);
+        assert!(optimistic.allowed);
+        let started = Instant::now();
+        let (borrow, outcome) = m.borrow_check("lease", &rule, 0, started).await;
+        assert!(borrow.allowed);
+        assert_eq!(outcome, BorrowOutcome::FallbackAllowed);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "borrow fallback exceeded the request deadline"
+        );
+
+        let concurrent_rule = Rule {
+            limit: 20.0,
+            period_s: 1.0,
+            burst: 20.0,
+            cost: 1.0,
+        };
+        let now = Instant::now();
+        for _ in 0..m.batch(&concurrent_rule) as usize {
+            let (verdict, _) = m.check("concurrent", &concurrent_rule, now);
+            assert!(verdict.allowed);
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(11));
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let m = Arc::clone(&m);
+            let barrier = Arc::clone(&barrier);
+            let rule = concurrent_rule.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let started = Instant::now();
+                let (verdict, outcome) = m.borrow_check("concurrent", &rule, 0, started).await;
+                (verdict, outcome, started.elapsed())
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            let (verdict, outcome, elapsed) = task.await.unwrap();
+            assert!(verdict.allowed);
+            assert_eq!(outcome, BorrowOutcome::FallbackAllowed);
+            assert!(
+                elapsed < Duration::from_millis(50),
+                "coalesced waiter retried the slow store for {elapsed:?}"
+            );
+        }
+        assert_eq!(
+            store.reserve_calls.load(AtomicOrdering::Relaxed),
+            2,
+            "one sequential and one concurrent-cohort borrow may reach the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn breaker_cooldown_starts_when_a_store_timeout_finishes() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct CountingTimeoutStore(AtomicUsize);
+        impl Store for CountingTimeoutStore {
+            async fn reserve(
+                &self,
+                _k: &str,
+                _r: f64,
+                _b: f64,
+                _req: f64,
+                _now: u64,
+                _ttl: u64,
+            ) -> Result<crate::store::Reservation, crate::store::StoreError> {
+                unreachable!()
+            }
+
+            async fn gcra_check(
+                &self,
+                _k: &str,
+                _r: f64,
+                _b: f64,
+                _cost: f64,
+                _now: u64,
+                _ttl: u64,
+            ) -> Result<crate::store::GcraVerdict, crate::store::StoreError> {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                unreachable!()
+            }
+        }
+
+        let store = Arc::new(CountingTimeoutStore(AtomicUsize::new(0)));
+        let m = LeaseManager::new(
+            Arc::clone(&store),
+            CircuitBreaker::new(1, Duration::from_millis(5), Instant::now()),
+            LeaseConfig {
+                store_timeout_ms: 20,
+                exact_failure_mode: StoreFailureMode::Local,
+                ..LeaseConfig::default()
+            },
+        );
+        let rule = Rule {
+            limit: 2.0,
+            period_s: 1.0,
+            burst: 2.0,
+            cost: 1.0,
+        };
+
+        let (_, first) = m.exact_check("k", &rule, 0, Instant::now()).await;
+        assert_eq!(first, ExactOutcome::FallbackAllowed);
+        let started = Instant::now();
+        let (_, second) = m.exact_check("k", &rule, 0, started).await;
+        assert_eq!(second, ExactOutcome::FallbackAllowed);
+        assert!(started.elapsed() < Duration::from_millis(15));
+        assert_eq!(store.0.load(AtomicOrdering::Relaxed), 1);
     }
 
     // ------------------------------------------------------------------
@@ -1280,41 +1930,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn borrow_honors_fail_open_when_store_is_down() {
-        struct DownStore;
-        impl Store for DownStore {
-            async fn reserve(
-                &self,
-                _k: &str,
-                _r: f64,
-                _b: f64,
-                _req: f64,
-                _now: u64,
-                _ttl: u64,
-            ) -> Result<crate::store::Reservation, crate::store::StoreError> {
-                Err(crate::store::StoreError::Connection("down".into()))
-            }
-            async fn gcra_check(
-                &self,
-                _k: &str,
-                _r: f64,
-                _b: f64,
-                _c: f64,
-                _now: u64,
-                _ttl: u64,
-            ) -> Result<crate::store::GcraVerdict, crate::store::StoreError> {
-                Err(crate::store::StoreError::Connection("down".into()))
-            }
-        }
-
-        // fail_open=true: once the optimistic pool is drained, requests are
+    async fn borrow_honors_open_and_closed_modes_when_store_is_down() {
+        // Open mode: once the optimistic pool is drained, requests are
         // admitted degraded instead of silently fail-closing (the pre-0.2
         // "fail-static in name, fail-closed in effect" defect).
         let m = LeaseManager::new(
             Arc::new(DownStore),
             CircuitBreaker::new(1, Duration::from_secs(60), Instant::now()),
             LeaseConfig {
-                fail_open: true,
+                borrow_failure_mode: StoreFailureMode::Open,
                 ..LeaseConfig::default()
             },
         );
@@ -1326,23 +1950,23 @@ mod tests {
             assert!(v.allowed, "optimistic pool serves the first batch");
         }
         let (v, outcome) = check_then_borrow(&m, "k", &rule, 0, base).await;
-        assert!(
-            v.allowed,
-            "fail_open=true must admit when the store is down"
-        );
+        assert!(v.allowed, "open mode must admit when the store is down");
+        assert!(v.degraded);
+        assert!(!v.accounted);
         assert_eq!(outcome, Some(BorrowOutcome::FailOpen));
         // The breaker is now open (threshold 1): the next escalation resolves
-        // without a store call, still honoring fail_open.
+        // without a store call, still honoring the failure mode.
         let (v, outcome) = check_then_borrow(&m, "k", &rule, 0, base).await;
         assert!(v.allowed);
+        assert!(!v.accounted);
         assert_eq!(outcome, Some(BorrowOutcome::FailOpen));
 
-        // fail_open=false: the same situation denies.
+        // Closed mode: the same situation denies.
         let m = LeaseManager::new(
             Arc::new(DownStore),
             CircuitBreaker::new(1, Duration::from_secs(60), Instant::now()),
             LeaseConfig {
-                fail_open: false,
+                borrow_failure_mode: StoreFailureMode::Closed,
                 ..LeaseConfig::default()
             },
         );
@@ -1351,11 +1975,49 @@ mod tests {
             assert!(v.allowed);
         }
         let (v, outcome) = check_then_borrow(&m, "k", &rule, 0, base).await;
-        assert!(
-            !v.allowed,
-            "fail_open=false must deny when the store is down"
-        );
+        assert!(!v.allowed, "closed mode must deny when the store is down");
+        assert!(v.degraded);
+        assert!(!v.accounted);
         assert_eq!(outcome, Some(BorrowOutcome::FailClosed));
+    }
+
+    #[tokio::test]
+    async fn borrow_store_failure_uses_bounded_local_budget() {
+        let m = LeaseManager::new(
+            Arc::new(DownStore),
+            CircuitBreaker::new(100, Duration::from_secs(60), Instant::now()),
+            LeaseConfig {
+                borrow_failure_mode: StoreFailureMode::Local,
+                ..LeaseConfig::default()
+            },
+        );
+        let rule = Rule {
+            limit: 2.0,
+            period_s: 1.0,
+            burst: 2.0,
+            cost: 1.0,
+        };
+        let now = Instant::now();
+
+        let optimistic = m.batch(&rule) as usize;
+        for _ in 0..optimistic {
+            let (verdict, outcome) = check_then_borrow(&m, "k", &rule, 0, now).await;
+            assert!(verdict.allowed);
+            assert_eq!(outcome, None);
+        }
+        for _ in 0..2 {
+            let (verdict, outcome) = check_then_borrow(&m, "k", &rule, 0, now).await;
+            assert!(verdict.allowed);
+            assert!(verdict.degraded);
+            assert!(verdict.accounted);
+            assert_eq!(outcome, Some(BorrowOutcome::FallbackAllowed));
+        }
+        let (limited, outcome) = check_then_borrow(&m, "k", &rule, 0, now).await;
+        assert!(!limited.allowed);
+        assert!(limited.degraded);
+        assert!(limited.accounted);
+        assert_eq!(limited.retry_after_s, 1);
+        assert_eq!(outcome, Some(BorrowOutcome::FallbackLimited));
     }
 
     #[tokio::test]

@@ -65,7 +65,7 @@ pub trait Store: Send + Sync {
         ttl_ms: u64,
     ) -> Result<Reservation, StoreError>;
 
-    /// Exact per-request GCRA check (for `exact` mode / money limits). Unlike
+    /// Exact per-request GCRA check (for `exact` mode). Unlike
     /// `reserve`, this is called synchronously per request and round-trips the
     /// store every time — the deliberate exactness/latency trade.
     async fn gcra_check(
@@ -77,10 +77,4 @@ pub trait Store: Send + Sync {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<GcraVerdict, StoreError>;
-
-    /// Mark the store path for `key` unhealthy after an operation timeout.
-    ///
-    /// Implementations that cache network clients can drop the selected client
-    /// so background warm-up reconnects outside the request timeout path.
-    async fn mark_unhealthy(&self, _key: &str) {}
 }

@@ -1,13 +1,48 @@
 //! Plugin configuration, parsed from `[plugins.params]` in the hub TOML.
 
+use std::io;
+
 use haproxy_spoa_hub_plugin_api::PluginContext;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreFailureMode {
+    Local,
+    Open,
+    Closed,
+}
+
+impl StoreFailureMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, io::Error> {
+        match value {
+            "local" => Ok(Self::Local),
+            "open" => Ok(Self::Open),
+            "closed" => Ok(Self::Closed),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("store_failure_mode must be local, open, or closed; got {value}"),
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PluginConfig {
-    /// Allow the request when a rule can't be evaluated (bad rule). Default true
-    /// — a rate limiter must not become an outage. Money limits fail closed
-    /// per-rule (Phase 4).
+    /// Legacy failure switch. New deployments should set the store and invalid
+    /// rule policies independently.
     pub fail_open: bool,
+    /// Explicit policy for shared-store errors, timeouts, and an open breaker.
+    /// When absent, lease mode follows `fail_open` and exact mode fails closed.
+    pub store_failure_mode: Option<StoreFailureMode>,
+    /// Explicit malformed-rule policy. When absent, follows `fail_open`.
+    pub invalid_rule_fail_open: Option<bool>,
     /// Valkey/Redis URLs for the shared budget allocator. A single URL uses
     /// one store; multiple URLs shard keys across independent stores with a
     /// stable hash. URLs may point at plain Redis/Valkey, Sentinel, or any
@@ -43,6 +78,26 @@ pub struct PluginConfig {
 }
 
 impl PluginConfig {
+    pub fn lease_store_failure_mode(&self) -> StoreFailureMode {
+        self.store_failure_mode.unwrap_or(if self.fail_open {
+            StoreFailureMode::Open
+        } else {
+            StoreFailureMode::Closed
+        })
+    }
+
+    pub fn exact_store_failure_mode(&self) -> StoreFailureMode {
+        self.store_failure_mode.unwrap_or(StoreFailureMode::Closed)
+    }
+
+    pub fn effective_invalid_rule_fail_open(&self) -> bool {
+        self.invalid_rule_fail_open.unwrap_or(self.fail_open)
+    }
+
+    pub fn use_legacy_optimistic_cold_start(&self) -> bool {
+        self.store_failure_mode.is_none()
+    }
+
     pub fn from_context(
         context: &PluginContext,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -77,8 +132,18 @@ impl PluginConfig {
                 .unwrap_or_default();
         }
 
+        let store_failure_mode = context
+            .get_config("store_failure_mode")
+            .and_then(|v| v.as_str())
+            .map(StoreFailureMode::parse)
+            .transpose()?;
+
         Ok(PluginConfig {
             fail_open: get_bool("fail_open", true),
+            store_failure_mode,
+            invalid_rule_fail_open: context
+                .get_config("invalid_rule_fail_open")
+                .and_then(|v| v.as_bool()),
             store_urls,
             interval_ms: get_u64("sync_interval_ms", 200, 1, 60_000),
             low_water_percent: get_u64("low_water_percent", 20, 0, 100),
@@ -97,7 +162,9 @@ impl PluginConfig {
         r#"{
   "type": "object",
   "properties": {
-    "fail_open": { "type": "boolean" },
+    "fail_open": { "type": "boolean", "description": "Legacy fallback for invalid rules and lease store failures when their explicit policies are absent" },
+    "store_failure_mode": { "type": "string", "enum": ["local", "open", "closed"], "description": "Store outage policy: bounded per-sidecar fallback, allow, or deny" },
+    "invalid_rule_fail_open": { "type": "boolean", "description": "Allow malformed rules independently of the store outage policy" },
     "store_url": { "type": "string", "description": "Single Valkey/Redis URL; unset with no store_urls = per-pod in-process store" },
     "store_urls": { "type": "array", "items": { "type": "string" }, "description": "Valkey/Redis URLs; keys are sharded across entries with a stable hash" },
     "sync_interval_ms": { "type": "integer", "minimum": 1 },
@@ -112,5 +179,65 @@ impl PluginConfig {
     "borrow_on_empty": { "type": "boolean", "description": "Empty local pool escalates to one bounded store borrow before denying (burst correctness); default true" }
   }
 }"#
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use haproxy_spoa_hub_plugin_api::{ConfigValue, RHashMap, RString};
+
+    fn context(values: &[(&str, ConfigValue)]) -> PluginContext {
+        let mut config = RHashMap::new();
+        for (key, value) in values {
+            config.insert(RString::from(*key), value.clone());
+        }
+        PluginContext {
+            name: RString::from("rate_limit"),
+            config,
+        }
+    }
+
+    #[test]
+    fn absent_new_policies_preserve_legacy_behavior() {
+        let default = PluginConfig::from_context(&context(&[])).unwrap();
+        assert_eq!(default.lease_store_failure_mode(), StoreFailureMode::Open);
+        assert_eq!(default.exact_store_failure_mode(), StoreFailureMode::Closed);
+        assert!(default.effective_invalid_rule_fail_open());
+        assert!(default.use_legacy_optimistic_cold_start());
+
+        let closed =
+            PluginConfig::from_context(&context(&[("fail_open", ConfigValue::Bool(false))]))
+                .unwrap();
+        assert_eq!(closed.lease_store_failure_mode(), StoreFailureMode::Closed);
+        assert_eq!(closed.exact_store_failure_mode(), StoreFailureMode::Closed);
+        assert!(!closed.effective_invalid_rule_fail_open());
+        assert!(closed.use_legacy_optimistic_cold_start());
+    }
+
+    #[test]
+    fn explicit_policies_are_independent() {
+        let config = PluginConfig::from_context(&context(&[
+            (
+                "store_failure_mode",
+                ConfigValue::String(RString::from("local")),
+            ),
+            ("invalid_rule_fail_open", ConfigValue::Bool(false)),
+        ]))
+        .unwrap();
+        assert_eq!(config.lease_store_failure_mode(), StoreFailureMode::Local);
+        assert_eq!(config.exact_store_failure_mode(), StoreFailureMode::Local);
+        assert!(!config.effective_invalid_rule_fail_open());
+        assert!(!config.use_legacy_optimistic_cold_start());
+    }
+
+    #[test]
+    fn rejects_unknown_store_failure_mode() {
+        let error = PluginConfig::from_context(&context(&[(
+            "store_failure_mode",
+            ConfigValue::String(RString::from("sometimes")),
+        )]))
+        .unwrap_err();
+        assert!(error.to_string().contains("local, open, or closed"));
     }
 }

@@ -52,6 +52,17 @@ struct DeferredValkeyStore {
     inner: AsyncMutex<Option<Arc<ValkeyStore>>>,
 }
 
+fn take_if_current<T>(current: &mut Option<Arc<T>>, expected: &Arc<T>) -> Option<Arc<T>> {
+    if current
+        .as_ref()
+        .is_some_and(|value| Arc::ptr_eq(value, expected))
+    {
+        current.take()
+    } else {
+        None
+    }
+}
+
 impl DeferredValkeyStore {
     fn new(url: String) -> Self {
         Self {
@@ -78,27 +89,47 @@ impl DeferredValkeyStore {
         Ok(())
     }
 
-    async fn invalidate(&self) {
-        let stale = self.inner.lock().await.take();
+    fn invalidate_if_current_unlocked(&self, store: &Arc<ValkeyStore>) {
+        let Ok(mut guard) = self.inner.try_lock() else {
+            return;
+        };
+        let stale = take_if_current(&mut guard, store);
+        drop(guard);
         if let Some(stale) = stale {
-            stale.shutdown().await;
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    stale.shutdown().await;
+                });
+            }
+        }
+    }
+}
+
+/// Cancelling a timed-out call detaches only the client generation it used.
+struct DeferredStoreCall<'a> {
+    owner: &'a DeferredValkeyStore,
+    store: Arc<ValkeyStore>,
+    completed: bool,
+}
+
+impl<'a> DeferredStoreCall<'a> {
+    fn new(owner: &'a DeferredValkeyStore, store: Arc<ValkeyStore>) -> Self {
+        Self {
+            owner,
+            store,
+            completed: false,
         }
     }
 
-    async fn invalidate_if_current(&self, store: &Arc<ValkeyStore>) {
-        let stale = {
-            let mut guard = self.inner.lock().await;
-            if guard
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, store))
-            {
-                guard.take()
-            } else {
-                None
-            }
-        };
-        if let Some(stale) = stale {
-            stale.shutdown().await;
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for DeferredStoreCall<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.owner.invalidate_if_current_unlocked(&self.store);
         }
     }
 }
@@ -114,16 +145,14 @@ impl Store for DeferredValkeyStore {
         ttl_ms: u64,
     ) -> Result<Reservation, StoreError> {
         let store = self.get_connected().await?;
-        match store
+        let mut call = DeferredStoreCall::new(self, Arc::clone(&store));
+        let result = store
             .reserve(key, rate, burst, requested, now_ms, ttl_ms)
-            .await
-        {
-            Ok(reservation) => Ok(reservation),
-            Err(err) => {
-                self.invalidate_if_current(&store).await;
-                Err(err)
-            }
+            .await;
+        if result.is_ok() {
+            call.complete();
         }
+        result
     }
 
     async fn gcra_check(
@@ -136,20 +165,14 @@ impl Store for DeferredValkeyStore {
         ttl_ms: u64,
     ) -> Result<crate::store::GcraVerdict, StoreError> {
         let store = self.get_connected().await?;
-        match store
+        let mut call = DeferredStoreCall::new(self, Arc::clone(&store));
+        let result = store
             .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
-            .await
-        {
-            Ok(verdict) => Ok(verdict),
-            Err(err) => {
-                self.invalidate_if_current(&store).await;
-                Err(err)
-            }
+            .await;
+        if result.is_ok() {
+            call.complete();
         }
-    }
-
-    async fn mark_unhealthy(&self, _key: &str) {
-        self.invalidate().await;
+        result
     }
 }
 
@@ -207,10 +230,6 @@ impl Store for ShardedValkeyStore {
             .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
             .await
     }
-
-    async fn mark_unhealthy(&self, key: &str) {
-        self.shard(key).invalidate().await;
-    }
 }
 
 impl Store for AnyStore {
@@ -241,13 +260,6 @@ impl Store for AnyStore {
         match self {
             AnyStore::Valkey(s) => s.gcra_check(key, rate, burst, cost, now_ms, ttl_ms).await,
             AnyStore::Memory(s) => s.gcra_check(key, rate, burst, cost, now_ms, ttl_ms).await,
-        }
-    }
-
-    async fn mark_unhealthy(&self, key: &str) {
-        match self {
-            AnyStore::Valkey(s) => s.mark_unhealthy(key).await,
-            AnyStore::Memory(s) => s.mark_unhealthy(key).await,
         }
     }
 }
@@ -391,7 +403,9 @@ define_plugin!(RateLimitPlugin, {
             idle_ttl_ms: config.idle_ttl_ms,
             store_timeout_ms: config.store_timeout_ms,
             borrow_on_empty: config.borrow_on_empty,
-            fail_open: config.fail_open,
+            optimistic_cold_start: config.use_legacy_optimistic_cold_start(),
+            borrow_failure_mode: config.lease_store_failure_mode(),
+            exact_failure_mode: config.exact_store_failure_mode(),
         };
         let manager = Arc::new(LeaseManager::new(Arc::new(store), breaker, lease_cfg));
 
@@ -448,10 +462,14 @@ define_plugin!(RateLimitPlugin, {
             None => {
                 log::warn!(
                     "ratelimit: key={key} has no valid limit/period; failing {}",
-                    if config.fail_open { "open" } else { "closed" }
+                    if config.effective_invalid_rule_fail_open() {
+                        "open"
+                    } else {
+                        "closed"
+                    }
                 );
                 METRICS.counter("ratelimit_requests_total", &[("outcome", "bad_rule")], 1);
-                let v = if config.fail_open {
+                let v = if config.effective_invalid_rule_fail_open() {
                     Verdict::allow()
                 } else {
                     Verdict::deny()
@@ -460,9 +478,8 @@ define_plugin!(RateLimitPlugin, {
             }
         };
 
-        // Exact mode (money/contract limits): a synchronous GCRA round-trip per
-        // request — the deliberate exactness/latency trade, scoped to opted-in
-        // keys, never the fleet default.
+        // Exact mode: a synchronous GCRA round-trip per request, scoped to
+        // opted-in keys rather than the fleet default.
         if message
             .get_string("mode")
             .is_some_and(|m| m.eq_ignore_ascii_case("exact"))
@@ -471,18 +488,11 @@ define_plugin!(RateLimitPlugin, {
                 .runtime
                 .as_ref()
                 .ok_or("plugin not initialized: runtime missing")?;
-            let verdict =
+            let (verdict, outcome) =
                 runtime.block_on(manager.exact_check(key, &rule, wall_ms(), Instant::now()));
             METRICS.counter(
                 "ratelimit_requests_total",
-                &[(
-                    "outcome",
-                    if verdict.allowed {
-                        "exact_allowed"
-                    } else {
-                        "exact_limited"
-                    },
-                )],
+                &[("outcome", outcome.as_str())],
                 1,
             );
             return Ok(build_result(&verdict));
@@ -555,6 +565,8 @@ impl Verdict {
     fn allow() -> Self {
         Verdict {
             allowed: true,
+            degraded: false,
+            accounted: false,
             limit: 0,
             remaining: 0,
             reset_s: 0,
@@ -566,6 +578,8 @@ impl Verdict {
     fn deny() -> Self {
         Verdict {
             allowed: false,
+            degraded: false,
+            accounted: false,
             limit: 0,
             remaining: 0,
             reset_s: 0,
@@ -576,11 +590,22 @@ impl Verdict {
 
 /// Build the `txn.hub.rate_limit.*` variables from a verdict.
 fn build_result(v: &Verdict) -> ProcessingResult {
-    let mut vars: RVec<TxnVariable> = RVec::with_capacity(5);
+    let mut vars: RVec<TxnVariable> = RVec::with_capacity(if v.accounted { 7 } else { 3 });
     vars.push(TxnVariable::transaction(
         "allowed",
         SpoeValue::Bool(v.allowed),
     ));
+    vars.push(TxnVariable::transaction(
+        "degraded",
+        SpoeValue::Bool(v.degraded),
+    ));
+    vars.push(TxnVariable::transaction(
+        "accounted",
+        SpoeValue::Bool(v.accounted),
+    ));
+    if !v.accounted {
+        return ProcessingResult { variables: vars };
+    }
     vars.push(TxnVariable::transaction(
         "limit",
         SpoeValue::Uint32(v.limit),
@@ -629,5 +654,51 @@ mod tests {
             stable_hash64(b"default/ingress|127.0.0.1"),
             7262911014780214683
         );
+    }
+
+    #[test]
+    fn stale_timeout_cannot_detach_a_replacement_client() {
+        let stale = Arc::new(1);
+        let replacement = Arc::new(2);
+        let mut current = Some(Arc::clone(&replacement));
+
+        assert!(take_if_current(&mut current, &stale).is_none());
+        assert!(
+            current
+                .as_ref()
+                .is_some_and(|value| Arc::ptr_eq(value, &replacement))
+        );
+        assert!(take_if_current(&mut current, &replacement).is_some());
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn result_exposes_degradation_and_accounting_separately_from_allowance() {
+        let result = build_result(&Verdict {
+            allowed: true,
+            degraded: true,
+            accounted: false,
+            limit: 10,
+            remaining: 2,
+            reset_s: 3,
+            retry_after_s: 0,
+        });
+        let degraded = result
+            .variables
+            .iter()
+            .find(|variable| variable.name.as_str() == "degraded")
+            .expect("degraded variable");
+        assert!(matches!(degraded.value, SpoeValue::Bool(true)));
+        let accounted = result
+            .variables
+            .iter()
+            .find(|variable| variable.name.as_str() == "accounted")
+            .expect("accounted variable");
+        assert!(matches!(accounted.value, SpoeValue::Bool(false)));
+        assert_eq!(result.variables.len(), 3);
+        assert!(result.variables.iter().all(|variable| !matches!(
+            variable.name.as_str(),
+            "limit" | "remaining" | "reset" | "retry_after"
+        )));
     }
 }

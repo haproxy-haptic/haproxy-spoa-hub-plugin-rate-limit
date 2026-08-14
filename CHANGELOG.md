@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-14
+
+### Added
+
+- Add `store_failure_mode = "local" | "open" | "closed"` for both lease and
+  exact store failures. `local` enforces a bounded per-sidecar emergency
+  token bucket; it does not provide fleet-global exactness during an outage.
+- Add `invalid_rule_fail_open` so malformed-rule handling is independent of
+  shared-store availability policy.
+- Add `txn.hub.rate_limit.degraded` and `txn.hub.rate_limit.accounted` verdicts,
+  plus distinct request outcomes for local fallback allowance, local fallback
+  exhaustion, capacity fail-open, unconditional fail-open, and fail-closed
+  decisions.
+
+### Fixed
+
+- Return store-failure verdicts within `store_timeout_ms` with non-blocking,
+  generation-safe connection invalidation and one failed store attempt per
+  coalesced borrow cohort.
+- Prevent explicit store-failure policies from spending an unbacked optimistic
+  lease on a new key; legacy configurations retain their prior cold-start behavior.
+
 ## [0.2.0] - 2026-07-18
 
 ### Fixed
