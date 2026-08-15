@@ -79,13 +79,21 @@ impl DeferredValkeyStore {
             .ok_or_else(|| StoreError::Connection("shared store is not connected yet".into()))
     }
 
+    /// Connect outside the lock: a slow connect must never block
+    /// `get_connected` (which would turn every reserve into a timeout) or
+    /// keep `invalidate_if_current_unlocked` from swapping a dead client out.
     async fn connect_if_needed(&self) -> Result<(), StoreError> {
-        let mut guard = self.inner.lock().await;
-        if guard.is_some() {
+        if self.inner.lock().await.is_some() {
             return Ok(());
         }
         let store = Arc::new(ValkeyStore::connect(&self.url).await?);
-        *guard = Some(store);
+        let mut guard = self.inner.lock().await;
+        if guard.is_none() {
+            *guard = Some(store);
+        } else {
+            drop(guard);
+            store.shutdown().await;
+        }
         Ok(())
     }
 
@@ -646,6 +654,61 @@ mod tests {
 
         let mut second = RateLimitPlugin::__new();
         second.__init(&ctx).expect("second plugin generation init");
+    }
+
+    /// A listener that accepts and never answers: what a connection replaced
+    /// mid-failover looks like to the client.
+    fn black_hole() -> (String, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("redis://{}", listener.local_addr().expect("local addr"));
+        (url, listener)
+    }
+
+    #[tokio::test]
+    async fn hung_connect_fails_within_budget_and_never_blocks_get_connected() {
+        let (url, listener) = black_hole();
+        let _sink = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming().flatten() {
+                held.push(conn);
+            }
+        });
+
+        let store = Arc::new(DeferredValkeyStore::new(url));
+        let connecting = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.connect_if_needed().await })
+        };
+
+        // While the connect is hanging, a reserve must fail fast on "not
+        // connected yet" instead of queueing behind the connect's lock.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        let err = store
+            .get_connected()
+            .await
+            .err()
+            .expect("no client while connecting");
+        assert!(matches!(err, StoreError::Connection(_)), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "get_connected blocked {:?}",
+            started.elapsed()
+        );
+
+        let result = tokio::time::timeout(
+            crate::store::valkey::CONNECT_TIMEOUT + Duration::from_secs(1),
+            connecting,
+        )
+        .await
+        .expect("connect attempt must resolve within its budget")
+        .expect("join");
+        let err = result.expect_err("black hole cannot connect");
+        assert!(matches!(err, StoreError::Connection(_)), "{err:?}");
+        assert!(
+            store.get_connected().await.is_err(),
+            "a failed attempt installs nothing"
+        );
     }
 
     #[test]
