@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A shared-store connect that never resolved pinned the sidecar in local
+  fallback for good: the deferred store held its lock across an unbounded
+  `ValkeyStore::connect`, so after a Sentinel failover one lost `SCRIPT LOAD`
+  reply left every reserve timing out behind the lock and nothing able to swap
+  the dead client out (observed on a live cluster: one of two sidecars degraded
+  until its pod was restarted). Connects are now bounded (2s), run outside the
+  lock, and fred commands carry a default timeout instead of waiting forever.
+
 ## [0.3.0] - 2026-08-14
 
 ### Added
