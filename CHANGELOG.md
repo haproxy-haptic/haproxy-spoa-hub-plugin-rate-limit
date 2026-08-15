@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-15
+
 ### Fixed
 
 - A shared-store connect that never resolved pinned the sidecar in local
