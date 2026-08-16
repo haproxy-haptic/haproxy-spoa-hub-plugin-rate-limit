@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-16
+
+### Changed
+
+- Built against plugin-api 0.8 (`api_version` 4): on hub 0.13.0 or later the plugin's log records appear in the hub log (`"target":"plugin"`, `plugin=<name>`, `span.req_id` for records logged during a request). Older hubs load the plugin unchanged; its records stay silent there.
+- The store connection warm-up logs one `warn` per outage (`shared store not reachable, serving from the local fallback`) and `info` when the connection is ready again; the 200 ms retries stay at `debug`. Until now the only visible trace of a lost store was the fallback verdicts.
+
 ## [0.3.1] - 2026-08-15
 
 ### Fixed

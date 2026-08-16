@@ -398,11 +398,12 @@ dependencies = [
 
 [[package]]
 name = "haproxy-spoa-hub-plugin-api"
-version = "0.7.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2628b1dc202499239c3490de29b85ee3bbe18f41bed2984793f150ffede2feb4"
+checksum = "b59152cc227ba72e76b6529f986cc56ea3a222a2d287c1b986c1f45a6917e40b"
 dependencies = [
  "abi_stable",
+ "log",
 ]
 
 [[package]]
@@ -702,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "rate-limit-plugin"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fred",
  "haproxy-spoa-hub-plugin-api",
