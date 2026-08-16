@@ -291,19 +291,29 @@ struct PrefetchReq {
 async fn warm_valkey_connection(store: Arc<DeferredValkeyStore>) {
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut logged_ready = false;
+    let mut ready = false;
+    let mut warned = false;
 
     loop {
         match store.connect_if_needed().await {
             Ok(_) => {
-                if !logged_ready {
+                if !ready {
                     log::info!("ratelimit: shared store connection ready");
-                    logged_ready = true;
+                    ready = true;
+                    warned = false;
                 }
             }
             Err(e) => {
-                logged_ready = false;
-                log::debug!("ratelimit: shared store connection not ready yet: {e}");
+                // One warning per outage; the 200 ms retries stay at debug.
+                if warned {
+                    log::debug!("ratelimit: shared store connection not ready yet: {e}");
+                } else {
+                    log::warn!(
+                        "ratelimit: shared store not reachable, serving from the local fallback: {e}"
+                    );
+                    warned = true;
+                }
+                ready = false;
             }
         }
         ticker.tick().await;

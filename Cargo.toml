@@ -1,6 +1,6 @@
 [package]
 name = "rate-limit-plugin"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.86"
 description = "Shared low-latency (local-first, lease-amortized) rate-limiting + quotas plugin for haproxy-spoa-hub"
@@ -13,7 +13,7 @@ repository = "https://gitlab.com/haproxy-haptic/haproxy-spoa-hub-plugin-rate-lim
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-haproxy-spoa-hub-plugin-api = "0.7"
+haproxy-spoa-hub-plugin-api = "0.8"
 log = "0.4"
 # Async Valkey/Redis client for the shared-tier lease allocator. The per-request
 # hot path stays synchronous + in-memory; fred is used only on the background
