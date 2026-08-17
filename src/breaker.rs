@@ -12,7 +12,9 @@
 //! - **Closed** — healthy; lease refreshes proceed. Trips to Open after
 //!   `failure_threshold` consecutive failures.
 //! - **Open** — the store is skipped entirely until `cooldown` elapses.
-//! - **HalfOpen** — exactly one probe is permitted; its outcome decides.
+//! - **HalfOpen** — exactly one probe is permitted; its outcome decides. A
+//!   probe that never reports (a lost caller) is reclaimed after one cooldown,
+//!   so a stuck probe can never pin the breaker in HalfOpen.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -31,6 +33,8 @@ struct Inner {
     open_until: Instant,
     /// Whether a HalfOpen probe is currently outstanding (only one allowed).
     probe_in_flight: bool,
+    /// When the outstanding probe was handed out; reclaimed after `cooldown`.
+    probe_started: Instant,
 }
 
 pub struct CircuitBreaker {
@@ -47,6 +51,7 @@ impl CircuitBreaker {
                 consecutive_failures: 0,
                 open_until: now,
                 probe_in_flight: false,
+                probe_started: now,
             }),
             failure_threshold: failure_threshold.max(1),
             cooldown,
@@ -55,17 +60,22 @@ impl CircuitBreaker {
 
     /// Should the caller attempt a store operation now? `true` in Closed, and
     /// once per cooldown in Open (the HalfOpen probe). `false` while Open and
-    /// within cooldown, or while a probe is already outstanding.
+    /// within cooldown, or while a probe is already outstanding. A caller that
+    /// gets `true` in HalfOpen owns the probe and must report `on_success` or
+    /// `on_failure`; one that does not is reclaimed after `cooldown`.
     pub fn allow(&self, now: Instant) -> bool {
         let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match s.state {
             State::Closed => true,
             State::HalfOpen => {
-                // Only one probe at a time.
-                if s.probe_in_flight {
+                // Only one probe at a time; a lost one is reclaimed.
+                let probe_lost =
+                    s.probe_in_flight && now.duration_since(s.probe_started) >= self.cooldown;
+                if s.probe_in_flight && !probe_lost {
                     false
                 } else {
                     s.probe_in_flight = true;
+                    s.probe_started = now;
                     true
                 }
             }
@@ -73,6 +83,7 @@ impl CircuitBreaker {
                 if now >= s.open_until {
                     s.state = State::HalfOpen;
                     s.probe_in_flight = true;
+                    s.probe_started = now;
                     true
                 } else {
                     false
@@ -179,5 +190,18 @@ mod tests {
         assert_eq!(cb.state(), State::Open);
         assert!(!cb.allow(at(t0, 1500))); // cooldown restarts from the probe failure
         assert!(cb.allow(at(t0, 2000)));
+    }
+
+    #[test]
+    fn a_probe_that_never_reports_is_reclaimed_after_a_cooldown() {
+        let t0 = Instant::now();
+        let cb = CircuitBreaker::new(1, Duration::from_secs(1), t0);
+        cb.on_failure(t0);
+        assert!(cb.allow(at(t0, 1000))); // probe handed out, never reported
+        assert!(!cb.allow(at(t0, 1500))); // still owned by the lost caller
+        assert!(cb.allow(at(t0, 2000))); // reclaimed: a new probe may run
+        assert!(!cb.allow(at(t0, 2100))); // and it is again the only one
+        cb.on_success();
+        assert_eq!(cb.state(), State::Closed);
     }
 }
