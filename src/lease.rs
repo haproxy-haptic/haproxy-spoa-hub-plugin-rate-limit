@@ -521,9 +521,6 @@ impl<S: Store> LeaseManager<S> {
     /// from the shared store and deposit it. Skips when the circuit breaker is
     /// open (fail-static). No-op for an unknown key.
     pub async fn refresh(&self, key: &str, now_ms: u64, now: Instant) {
-        if !self.breaker.allow(now) {
-            return;
-        }
         let Some(entry) = self.lookup(key) else {
             return;
         };
@@ -539,6 +536,12 @@ impl<S: Store> LeaseManager<S> {
         let deficit = (target - entry.bucket.available(now)).max(0.0);
         if deficit <= 0.0 {
             entry.clear_refresh_pending();
+            return;
+        }
+        // Consulted only when a store call follows: in HalfOpen `allow` hands
+        // out the single probe, and a caller that returns without reporting
+        // would leave the breaker waiting on it.
+        if !self.breaker.allow(now) {
             return;
         }
         match tokio::time::timeout(
@@ -1029,6 +1032,59 @@ mod tests {
         m.refresh("k", 100, base).await; // open -> short-circuits (no panic)
         let (v2, _) = m.check("k", &rule, base);
         assert!(v2.allowed); // pool still serves its optimistic tokens (fail-static)
+    }
+
+    #[tokio::test]
+    async fn refresh_without_a_deficit_leaves_the_half_open_probe_to_a_real_call() {
+        struct DownStore;
+        impl Store for DownStore {
+            async fn reserve(
+                &self,
+                _k: &str,
+                _r: f64,
+                _b: f64,
+                _req: f64,
+                _now: u64,
+                _ttl: u64,
+            ) -> Result<crate::store::Reservation, crate::store::StoreError> {
+                Err(crate::store::StoreError::Connection("down".into()))
+            }
+            async fn gcra_check(
+                &self,
+                _k: &str,
+                _r: f64,
+                _b: f64,
+                _cost: f64,
+                _now: u64,
+                _ttl: u64,
+            ) -> Result<crate::store::GcraVerdict, crate::store::StoreError> {
+                Err(crate::store::StoreError::Connection("down".into()))
+            }
+        }
+        let m = LeaseManager::new(
+            Arc::new(DownStore),
+            CircuitBreaker::new(1, Duration::from_secs(1), Instant::now()),
+            LeaseConfig::default(),
+        );
+        let rule = Rule {
+            limit: 100.0,
+            period_s: 1.0,
+            burst: 100.0,
+            cost: 1.0,
+        };
+        let base = Instant::now();
+        // One optimistic take, then a failing refresh trips the breaker.
+        m.check("k", &rule, base);
+        m.refresh("k", 0, base).await;
+        assert_eq!(m.breaker.state(), crate::breaker::State::Open);
+        // Cooldown over: the idle key's refresh has nothing to reserve, so it
+        // must not take the single half-open probe.
+        let later = base + Duration::from_secs(2);
+        m.refresh("k", 2_000, later).await;
+        assert!(
+            m.breaker.allow(later),
+            "an idle refresh consumed the half-open probe"
+        );
     }
 
     #[tokio::test]

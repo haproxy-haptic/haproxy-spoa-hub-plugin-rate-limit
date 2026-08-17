@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- After a shared-store outage the sidecar could stay in the local fallback for good: when the breaker's cooldown expired, the periodic lease refresh took the single half-open probe and, having no deficit to reserve, returned without reporting, so no exact check or borrow could ever probe the store again (seen in HAPTIC's e2e: authoritative exact verdicts never came back after Valkey recovered). `refresh` now consults the breaker only when it is about to call the store, and a probe that never reports is reclaimed after one cooldown.
+
 ## [0.4.0] - 2026-08-16
 
 ### Changed
