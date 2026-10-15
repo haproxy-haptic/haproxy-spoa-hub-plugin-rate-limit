@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Development and releases moved to GitHub (`https://github.com/haproxy-haptic/haproxy-spoa-hub-plugin-rate-limit`); GitLab is a read-only mirror.
+
 ## [0.4.2] - 2026-10-15
 
 ### Fixed
