@@ -12,6 +12,7 @@
 //! request, so all configured Valkey connections are warmed in the background at
 //! startup.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,7 +51,12 @@ enum AnyStore {
 struct DeferredValkeyStore {
     url: String,
     inner: AsyncMutex<Option<Arc<ValkeyStore>>>,
+    /// A call ran out of its caller's budget since the last liveness check.
+    stalled: AtomicBool,
 }
+
+/// Budget for the PING that decides whether a stalled client generation is alive.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn take_if_current<T>(current: &mut Option<Arc<T>>, expected: &Arc<T>) -> Option<Arc<T>> {
     if current
@@ -68,6 +74,7 @@ impl DeferredValkeyStore {
         Self {
             url,
             inner: AsyncMutex::new(None),
+            stalled: AtomicBool::new(false),
         }
     }
 
@@ -101,19 +108,39 @@ impl DeferredValkeyStore {
         let Ok(mut guard) = self.inner.try_lock() else {
             return;
         };
-        let stale = take_if_current(&mut guard, store);
-        drop(guard);
-        if let Some(stale) = stale {
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    stale.shutdown().await;
-                });
-            }
+        shutdown_in_background(take_if_current(&mut guard, store));
+    }
+
+    /// A reply that misses its request budget is usually late, not lost; dropping
+    /// the client would fail every caller until the reconnect and open the breaker.
+    async fn detach_if_unresponsive(&self) {
+        if !self.stalled.swap(false, Ordering::Relaxed) {
+            return;
         }
+        let Ok(store) = self.get_connected().await else {
+            return;
+        };
+        if let Ok(Ok(())) = tokio::time::timeout(LIVENESS_TIMEOUT, store.ping()).await {
+            return;
+        }
+        log::warn!(
+            "ratelimit: shared store missed a {}ms PING after a timed-out call; reconnecting",
+            LIVENESS_TIMEOUT.as_millis()
+        );
+        shutdown_in_background(take_if_current(&mut *self.inner.lock().await, &store));
     }
 }
 
-/// Cancelling a timed-out call detaches only the client generation it used.
+fn shutdown_in_background(stale: Option<Arc<ValkeyStore>>) {
+    if let (Some(stale), Ok(runtime)) = (stale, tokio::runtime::Handle::try_current()) {
+        runtime.spawn(async move {
+            stale.shutdown().await;
+        });
+    }
+}
+
+/// A failed call detaches the client generation it used; a call cancelled by
+/// its caller's budget only queues a liveness check.
 struct DeferredStoreCall<'a> {
     owner: &'a DeferredValkeyStore,
     store: Arc<ValkeyStore>,
@@ -129,15 +156,19 @@ impl<'a> DeferredStoreCall<'a> {
         }
     }
 
-    fn complete(&mut self) {
+    fn finish<T>(mut self, result: Result<T, StoreError>) -> Result<T, StoreError> {
         self.completed = true;
+        if result.is_err() {
+            self.owner.invalidate_if_current_unlocked(&self.store);
+        }
+        result
     }
 }
 
 impl Drop for DeferredStoreCall<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            self.owner.invalidate_if_current_unlocked(&self.store);
+            self.owner.stalled.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -153,14 +184,12 @@ impl Store for DeferredValkeyStore {
         ttl_ms: u64,
     ) -> Result<Reservation, StoreError> {
         let store = self.get_connected().await?;
-        let mut call = DeferredStoreCall::new(self, Arc::clone(&store));
-        let result = store
-            .reserve(key, rate, burst, requested, now_ms, ttl_ms)
-            .await;
-        if result.is_ok() {
-            call.complete();
-        }
-        result
+        let call = DeferredStoreCall::new(self, Arc::clone(&store));
+        call.finish(
+            store
+                .reserve(key, rate, burst, requested, now_ms, ttl_ms)
+                .await,
+        )
     }
 
     async fn gcra_check(
@@ -173,14 +202,12 @@ impl Store for DeferredValkeyStore {
         ttl_ms: u64,
     ) -> Result<crate::store::GcraVerdict, StoreError> {
         let store = self.get_connected().await?;
-        let mut call = DeferredStoreCall::new(self, Arc::clone(&store));
-        let result = store
-            .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
-            .await;
-        if result.is_ok() {
-            call.complete();
-        }
-        result
+        let call = DeferredStoreCall::new(self, Arc::clone(&store));
+        call.finish(
+            store
+                .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
+                .await,
+        )
     }
 }
 
@@ -302,6 +329,7 @@ async fn warm_valkey_connection(store: Arc<DeferredValkeyStore>) {
                     ready = true;
                     warned = false;
                 }
+                store.detach_if_unresponsive().await;
             }
             Err(e) => {
                 // One warning per outage; the 200 ms retries stay at debug.
@@ -719,6 +747,72 @@ mod tests {
             store.get_connected().await.is_err(),
             "a failed attempt installs nothing"
         );
+    }
+
+    /// CI contention or a paused server delays replies past the 10 ms request
+    /// budget; that alone must not replace the client (run 38649135234).
+    #[tokio::test]
+    async fn a_late_reply_keeps_the_client_and_a_missed_ping_replaces_it() {
+        let Ok(url) = std::env::var("VALKEY_URL") else {
+            eprintln!("SKIP: set VALKEY_URL (e.g. redis://127.0.0.1:6379) to run this test");
+            return;
+        };
+        use fred::prelude::{ClientLike, Config};
+        use fred::types::CustomCommand;
+        let admin =
+            fred::prelude::Client::new(Config::from_url(&url).expect("url"), None, None, None);
+        admin.init().await.expect("admin connect");
+        let admin = &admin;
+        let pause_all = |ms: i64| async move {
+            let pause = CustomCommand::new_static("CLIENT", None::<u16>, false);
+            let args = vec!["PAUSE".to_string(), ms.to_string(), "ALL".to_string()];
+            admin
+                .custom::<(), _>(pause, args)
+                .await
+                .expect("CLIENT PAUSE");
+        };
+        let store = DeferredValkeyStore::new(url);
+        store.connect_if_needed().await.expect("connect");
+        let first = store.get_connected().await.expect("connected");
+        let key = format!("late-reply-{}", wall_ms());
+        let cancel_one_call = || async {
+            let call = store.gcra_check(&key, 1.0, 1.0, 1.0, wall_ms(), 1000);
+            let budget = Duration::from_millis(10);
+            assert!(
+                tokio::time::timeout(budget, call).await.is_err(),
+                "the paused call must exceed its budget"
+            );
+        };
+
+        pause_all(200).await;
+        cancel_one_call().await;
+        let kept = store
+            .get_connected()
+            .await
+            .expect("a late reply keeps the client");
+        assert!(Arc::ptr_eq(&kept, &first));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        store.detach_if_unresponsive().await;
+        let kept = store
+            .get_connected()
+            .await
+            .expect("an answered PING keeps the client");
+        assert!(Arc::ptr_eq(&kept, &first));
+
+        let pause_ms = LIVENESS_TIMEOUT.as_millis() as i64 + 500;
+        pause_all(pause_ms).await;
+        cancel_one_call().await;
+        store.detach_if_unresponsive().await;
+        assert!(
+            store.get_connected().await.is_err(),
+            "a missed PING detaches the client"
+        );
+        store
+            .connect_if_needed()
+            .await
+            .expect("reconnect after the pause");
+        let replacement = store.get_connected().await.expect("replacement");
+        assert!(!Arc::ptr_eq(&replacement, &first));
     }
 
     #[test]

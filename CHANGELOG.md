@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-15
+
+### Fixed
+
+- A store reply slower than `store_timeout_ms` dropped the shared-store connection. The calls that followed failed with `shared store is not connected yet` until the reconnect, and those failures opened the circuit breaker, so one late reply under CPU contention put the sidecar on local budgets for a whole cooldown (seen in HAPTIC's e2e as consumer budgets not shared across pods). A timed-out call now keeps the connection; it is replaced only when it also misses a 1 s PING, which logs a `warn`. Store errors still reconnect immediately.
+
 ## [0.4.1] - 2026-08-18
 
 ### Fixed

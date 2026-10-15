@@ -13,7 +13,7 @@ test:
 	cargo test --workspace
 
 acceptance:
-	cargo test --test valkey_acceptance
+	cargo test --workspace
 
 acceptance-docker:
 	@name="ratelimit-valkey-test-$$(date +%s)-$$$$"; \
