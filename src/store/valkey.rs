@@ -69,6 +69,13 @@ impl ValkeyStore {
         })
     }
 
+    pub async fn ping(&self) -> Result<(), StoreError> {
+        self.client
+            .ping::<()>(None)
+            .await
+            .map_err(|e| StoreError::Connection(e.to_string()))
+    }
+
     /// Close the connection (best-effort).
     pub async fn shutdown(&self) {
         let _ = self.client.quit().await;
