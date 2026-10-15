@@ -1,6 +1,6 @@
 # haproxy-spoa-hub-plugin-rate-limit
 
-Shared, cross-fleet **rate limiting + quotas** for [haproxy-spoa-hub](https://gitlab.com/haproxy-haptic/haproxy-spoa-hub),
+Shared, cross-fleet **rate limiting + quotas** for [haproxy-spoa-hub](https://github.com/haproxy-haptic/haproxy-spoa-hub),
 built for **low latency first**.
 
 Where HAProxy's stick-tables are per-pod (a client hitting N replicas gets N× its

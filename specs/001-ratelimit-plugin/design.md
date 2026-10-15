@@ -31,7 +31,7 @@ haproxy-spoa-hub-plugin-rate-limit/
   src/negcache.rs       # L1 over-limit cache (+ RESP3 CLIENT TRACKING invalidation)
   src/keyspec.rs        # opaque key builder from SPOE args
   benches/ tests/ tests/e2e/ examples/{haproxy.cfg,hub.toml,spoe-ratelimit.conf}
-  Makefile CLAUDE.md README.md RELEASING.md renovate.json .gitlab-ci.yml
+  Makefile CLAUDE.md README.md RELEASING.md renovate.json .github/workflows/
   specs/001-ratelimit-plugin/{spec,plan,data-model,research,quickstart,tasks}.md
 ```
 

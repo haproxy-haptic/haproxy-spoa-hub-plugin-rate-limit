@@ -35,7 +35,7 @@ cargo fmt -- --check
 cargo build --release   # target/release/librate_limit_plugin.so
 ```
 
-CI (`.gitlab-ci.yml`) runs fmt + clippy (`-D warnings`) + test + a release build.
+CI (`.github/workflows/ci.yml`) runs fmt + clippy (`-D warnings`) + test + acceptance + a release build.
 Keep all four green.
 
 ## Conventions

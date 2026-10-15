@@ -9,7 +9,7 @@
 //!   docker run -d -p 6379:6379 valkey/valkey:8
 //!   VALKEY_URL=redis://127.0.0.1:6379 cargo test --test valkey_acceptance
 //!
-//! In CI a `services: valkey/valkey` provides the instance (see .gitlab-ci.yml).
+//! In CI a `services: valkey/valkey` provides the instance (see .github/workflows/ci.yml).
 //!
 //! Each test uses a unique key (nanosecond suffix) so runs are isolated without
 //! flushing the database.
