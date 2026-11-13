@@ -95,6 +95,9 @@ impl CircuitBreaker {
     /// Record a successful store operation: reset failures and close.
     pub fn on_success(&self) {
         let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if s.state != State::Closed {
+            log::info!("ratelimit: shared store circuit closed; store-backed checks resumed");
+        }
         s.state = State::Closed;
         s.consecutive_failures = 0;
         s.probe_in_flight = false;
@@ -113,6 +116,13 @@ impl CircuitBreaker {
             State::Closed | State::Open => {
                 s.consecutive_failures = s.consecutive_failures.saturating_add(1);
                 if s.consecutive_failures >= self.failure_threshold {
+                    if s.state == State::Closed {
+                        log::warn!(
+                            "ratelimit: shared store circuit open after {} consecutive failures; store-backed checks use the configured fallback for {}ms",
+                            s.consecutive_failures,
+                            self.cooldown.as_millis()
+                        );
+                    }
                     s.state = State::Open;
                     s.open_until = now + self.cooldown;
                 }

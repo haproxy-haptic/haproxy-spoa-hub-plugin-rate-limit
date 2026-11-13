@@ -89,19 +89,20 @@ impl DeferredValkeyStore {
     /// Connect outside the lock: a slow connect must never block
     /// `get_connected` (which would turn every reserve into a timeout) or
     /// keep `invalidate_if_current_unlocked` from swapping a dead client out.
-    async fn connect_if_needed(&self) -> Result<(), StoreError> {
+    /// Returns whether this call installed a new client.
+    async fn connect_if_needed(&self) -> Result<bool, StoreError> {
         if self.inner.lock().await.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         let store = Arc::new(ValkeyStore::connect(&self.url).await?);
         let mut guard = self.inner.lock().await;
         if guard.is_none() {
             *guard = Some(store);
-        } else {
-            drop(guard);
-            store.shutdown().await;
+            return Ok(true);
         }
-        Ok(())
+        drop(guard);
+        store.shutdown().await;
+        Ok(false)
     }
 
     fn invalidate_if_current_unlocked(&self, store: &Arc<ValkeyStore>) {
@@ -315,7 +316,7 @@ struct PrefetchReq {
     now_ms: u64,
 }
 
-async fn warm_valkey_connection(store: Arc<DeferredValkeyStore>) {
+async fn warm_valkey_connection(store: Arc<DeferredValkeyStore>, on_connect: impl Fn()) {
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut ready = false;
@@ -323,7 +324,10 @@ async fn warm_valkey_connection(store: Arc<DeferredValkeyStore>) {
 
     loop {
         match store.connect_if_needed().await {
-            Ok(_) => {
+            Ok(connected) => {
+                if connected {
+                    on_connect();
+                }
                 if !ready {
                     log::info!("ratelimit: shared store connection ready");
                     ready = true;
@@ -421,6 +425,7 @@ define_plugin!(RateLimitPlugin, {
             .enable_all()
             .build()?;
 
+        let mut shards = Vec::new();
         let store = if config.store_urls.is_empty() {
             log::info!("ratelimit: no store_url(s) configured — using per-pod in-process store");
             AnyStore::Memory(InMemoryStore::new())
@@ -430,9 +435,7 @@ define_plugin!(RateLimitPlugin, {
                 config.store_urls.len()
             );
             let store = Arc::new(ShardedValkeyStore::new(&config.store_urls));
-            for shard in store.shards() {
-                runtime.spawn(warm_valkey_connection(shard));
-            }
+            shards = store.shards().collect();
             AnyStore::Valkey(store)
         };
 
@@ -454,6 +457,12 @@ define_plugin!(RateLimitPlugin, {
             exact_failure_mode: config.exact_store_failure_mode(),
         };
         let manager = Arc::new(LeaseManager::new(Arc::new(store), breaker, lease_cfg));
+        for shard in shards {
+            let manager = Arc::clone(&manager);
+            runtime.spawn(warm_valkey_connection(shard, move || {
+                manager.store_reconnected()
+            }));
+        }
 
         let (tx, rx) = mpsc::channel(config.max_prefetch_queue);
         runtime.spawn(background(manager.clone(), rx, config.interval_ms));
@@ -772,7 +781,14 @@ mod tests {
                 .expect("CLIENT PAUSE");
         };
         let store = DeferredValkeyStore::new(url);
-        store.connect_if_needed().await.expect("connect");
+        assert!(
+            store.connect_if_needed().await.expect("connect"),
+            "a new client"
+        );
+        assert!(
+            !store.connect_if_needed().await.expect("reuse"),
+            "the same client"
+        );
         let first = store.get_connected().await.expect("connected");
         let key = format!("late-reply-{}", wall_ms());
         let cancel_one_call = || async {
