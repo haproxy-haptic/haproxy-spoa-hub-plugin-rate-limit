@@ -361,6 +361,12 @@ impl<S: Store> LeaseManager<S> {
         }
     }
 
+    /// A fresh connection round-trips the store (script preload), so it ends a
+    /// breaker opened by the outage instead of waiting out another cooldown.
+    pub fn store_reconnected(&self) {
+        self.breaker.on_success();
+    }
+
     pub fn config(&self) -> &LeaseConfig {
         &self.config
     }
@@ -1486,6 +1492,82 @@ mod tests {
         assert!(!v.allowed, "exact mode must fail closed on store timeout");
         assert!(v.degraded);
         assert_eq!(outcome, ExactOutcome::FailClosed);
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_ends_exact_fallback_without_waiting_for_the_cooldown() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct ToggleGcraStore {
+            down: AtomicBool,
+            inner: InMemoryStore,
+        }
+
+        impl Store for ToggleGcraStore {
+            async fn reserve(
+                &self,
+                _key: &str,
+                _rate: f64,
+                _burst: f64,
+                _requested: f64,
+                _now_ms: u64,
+                _ttl_ms: u64,
+            ) -> Result<crate::store::Reservation, crate::store::StoreError> {
+                unreachable!()
+            }
+
+            async fn gcra_check(
+                &self,
+                key: &str,
+                rate: f64,
+                burst: f64,
+                cost: f64,
+                now_ms: u64,
+                ttl_ms: u64,
+            ) -> Result<crate::store::GcraVerdict, crate::store::StoreError> {
+                if self.down.load(AtomicOrdering::Acquire) {
+                    return Err(crate::store::StoreError::Connection(
+                        "shared store is not connected yet".into(),
+                    ));
+                }
+                self.inner
+                    .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
+                    .await
+            }
+        }
+
+        let store = Arc::new(ToggleGcraStore {
+            down: AtomicBool::new(true),
+            inner: InMemoryStore::new(),
+        });
+        let m = LeaseManager::new(
+            Arc::clone(&store),
+            CircuitBreaker::new(3, Duration::from_secs(60), Instant::now()),
+            LeaseConfig {
+                exact_failure_mode: StoreFailureMode::Local,
+                ..LeaseConfig::default()
+            },
+        );
+        let rule = Rule {
+            limit: 100.0,
+            period_s: 60.0,
+            burst: 100.0,
+            cost: 1.0,
+        };
+        let now = Instant::now();
+        for _ in 0..4 {
+            m.exact_check("k", &rule, 0, now).await;
+        }
+        assert_eq!(m.breaker.state(), crate::breaker::State::Open);
+
+        store.down.store(false, AtomicOrdering::Release);
+        let (_, outcome) = m.exact_check("k", &rule, 0, now).await;
+        assert_eq!(outcome, ExactOutcome::FallbackAllowed, "still cooling down");
+
+        m.store_reconnected();
+        let (verdict, outcome) = m.exact_check("k", &rule, 0, now).await;
+        assert_eq!(outcome, ExactOutcome::Allowed);
+        assert!(!verdict.degraded);
     }
 
     #[tokio::test]
