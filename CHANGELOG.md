@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-13
+
 ### Fixed
 
 - After a store failover the circuit breaker stayed open until its cooldown ran out, even though the sidecar had already reconnected, so exact checks were served from local budgets for up to one more cooldown (seen in HAPTIC's e2e as a per-pod limit after a Sentinel failover). A new store connection now closes the breaker. The breaker also logs a `warn` when it opens and an `info` when it closes.
