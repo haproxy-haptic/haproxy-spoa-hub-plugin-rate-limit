@@ -61,6 +61,18 @@ local fallback counters produced the verdict and rate-limit headers; it is
 false for untracked fail-open and synthetic fail-closed decisions. When it is
 false, the plugin omits `limit`, `remaining`, `reset`, and `retry_after`.
 
+`mode` selects how a key is accounted:
+
+| Value | Behavior |
+|---|---|
+| `lease` (default) | Local token bucket fed by leases from the store. |
+| `exact` | One GCRA round trip to the store per request. |
+| `meter` | A score that drains at `limit` per `period`. A `cost` above zero is always recorded, even past `burst`; a zero or missing `cost` only reads. `allowed` is false while the score is at or above `burst`, for at most one `period`. Each sidecar caches a verdict for `interval_ms`, so reads stay off the store and a key that went over elsewhere is seen within one interval. A store failure allows and sets `degraded`, whatever `store_failure_mode` says. |
+
+Use `meter` to hold a key back because of what it did earlier, for example a
+client whose requests keep scoring in a WAF: read before the expensive check,
+charge the score after it.
+
 ## Store failure policy
 
 Set `store_failure_mode` in `[plugins.params]`:

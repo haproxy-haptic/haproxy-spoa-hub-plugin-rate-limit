@@ -5,7 +5,7 @@ use std::time::Duration;
 use fred::prelude::*;
 use fred::types::scripts::Script;
 
-use crate::store::{GcraVerdict, Reservation, Store, StoreError};
+use crate::store::{GcraVerdict, MeterVerdict, Reservation, Store, StoreError};
 
 /// Budget for connecting (Sentinel discovery + handshake + script preload).
 ///
@@ -19,11 +19,14 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RESERVE_LUA: &str = include_str!("reserve.lua");
 /// The exact GCRA script (see `gcra.lua`), for `exact` mode keys.
 const GCRA_LUA: &str = include_str!("gcra.lua");
+/// The meter script (see `meter.lua`), for `meter` mode keys.
+const METER_LUA: &str = include_str!("meter.lua");
 
 pub struct ValkeyStore {
     client: Client,
     reserve: Script,
     gcra: Script,
+    meter: Script,
 }
 
 impl ValkeyStore {
@@ -62,10 +65,16 @@ impl ValkeyStore {
         gcra.load(&client)
             .await
             .map_err(|e| StoreError::Protocol(e.to_string()))?;
+        let meter = Script::from_lua(METER_LUA);
+        meter
+            .load(&client)
+            .await
+            .map_err(|e| StoreError::Protocol(e.to_string()))?;
         Ok(Self {
             client,
             reserve,
             gcra,
+            meter,
         })
     }
 
@@ -136,6 +145,26 @@ impl Store for ValkeyStore {
         Ok(GcraVerdict {
             allowed: allowed == 1,
             retry_after_ms: retry_after.parse::<f64>().unwrap_or(0.0).ceil().max(0.0) as u64,
+        })
+    }
+
+    async fn meter(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        _now_ms: u64,
+    ) -> Result<MeterVerdict, StoreError> {
+        let args: Vec<String> = vec![format!("{rate}"), format!("{burst}"), format!("{cost}")];
+        let (under, over_ms): (i64, String) = self
+            .meter
+            .evalsha(&self.client, vec![key], args)
+            .await
+            .map_err(|e| StoreError::Protocol(e.to_string()))?;
+        Ok(MeterVerdict {
+            under: under == 1,
+            over_ms: over_ms.parse::<f64>().unwrap_or(0.0).ceil().max(0.0) as u64,
         })
     }
 }

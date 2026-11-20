@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::store::{GcraVerdict, Reservation, Store, StoreError};
+use crate::store::{GcraVerdict, MeterVerdict, Reservation, Store, StoreError};
 
 struct GlobalBucket {
     tokens: f64,
@@ -101,6 +101,36 @@ impl Store for InMemoryStore {
             })
         }
     }
+
+    async fn meter(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        now_ms: u64,
+    ) -> Result<MeterVerdict, StoreError> {
+        if rate <= 0.0 {
+            return Ok(MeterVerdict {
+                under: true,
+                over_ms: 0,
+            });
+        }
+        let emission = 1000.0 / rate;
+        let burst_offset = emission * burst;
+        let now = now_ms as f64;
+        let mut m = self.tats.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tat = m.get(key).copied().unwrap_or(now).max(now);
+        if cost > 0.0 {
+            tat = (tat + cost * emission).min(now + 2.0 * burst_offset);
+            m.insert(key.to_string(), tat);
+        }
+        let over = tat - now - burst_offset;
+        Ok(MeterVerdict {
+            under: over < 0.0,
+            over_ms: over.ceil().max(0.0) as u64,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +207,27 @@ mod tests {
         }
         assert!(admitted <= 5 + 10 + 1, "gcra admitted {admitted} over rate");
         assert!(admitted >= 10, "gcra starved: {admitted}");
+    }
+
+    #[tokio::test]
+    async fn meter_records_charges_past_burst_and_drains() {
+        let s = InMemoryStore::new();
+        // 10 points/s, over at 50.
+        assert!(s.meter("m", 10.0, 50.0, 0.0, 1000).await.unwrap().under);
+        assert!(s.meter("m", 10.0, 50.0, 45.0, 1000).await.unwrap().under);
+        // 45 + 15 = 60: over by 10 points, one second to drain below 50.
+        let v = s.meter("m", 10.0, 50.0, 15.0, 1000).await.unwrap();
+        assert!(!v.under);
+        assert_eq!(v.over_ms, 1000);
+        // A read does not charge.
+        assert!(!s.meter("m", 10.0, 50.0, 0.0, 1500).await.unwrap().under);
+        assert!(s.meter("m", 10.0, 50.0, 0.0, 2001).await.unwrap().under);
+    }
+
+    #[tokio::test]
+    async fn meter_debt_is_capped_at_twice_burst() {
+        let s = InMemoryStore::new();
+        let v = s.meter("m", 10.0, 50.0, 10_000.0, 1000).await.unwrap();
+        assert_eq!(v.over_ms, 5000);
     }
 }

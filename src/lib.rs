@@ -15,6 +15,7 @@ pub mod config;
 mod fallback;
 pub mod lease;
 pub mod limiter;
+pub mod meter;
 pub mod negcache;
 pub mod rule;
 pub mod store;

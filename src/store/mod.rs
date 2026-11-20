@@ -27,6 +27,15 @@ pub struct GcraVerdict {
     pub retry_after_ms: u64,
 }
 
+/// The outcome of a meter charge or read (for `meter` mode).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterVerdict {
+    /// The key's outstanding score is below `burst`.
+    pub under: bool,
+    /// Milliseconds until the score drains below `burst`, when it is not.
+    pub over_ms: u64,
+}
+
 /// A store failure. The lease manager treats any error as "store unavailable"
 /// and drives the circuit breaker; the local buckets keep enforcing their last
 /// lease (fail-static).
@@ -77,4 +86,22 @@ pub trait Store: Send + Sync {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<GcraVerdict, StoreError>;
+
+    /// Add `cost` to the score of `key`, which drains at `rate` per second, and
+    /// report whether the score is below `burst`. The charge is recorded even
+    /// when it puts the key over; a zero `cost` only reads. `now_ms` is used by
+    /// `InMemoryStore` only; `ValkeyStore` uses Valkey server time.
+    async fn meter(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        now_ms: u64,
+    ) -> Result<MeterVerdict, StoreError> {
+        let _ = (key, rate, burst, cost, now_ms);
+        Err(StoreError::Protocol(
+            "this store does not implement meter".to_string(),
+        ))
+    }
 }

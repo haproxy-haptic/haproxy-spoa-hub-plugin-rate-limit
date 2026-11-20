@@ -44,8 +44,9 @@ use crate::bucket::TokenBucket;
 use crate::config::StoreFailureMode;
 use crate::fallback::{FallbackDecision, FallbackLimiter};
 use crate::limiter::Verdict;
+use crate::meter::MeterCache;
 use crate::rule::Rule;
-use crate::store::Store;
+use crate::store::{MeterVerdict, Store};
 
 /// How a [`LeaseManager::borrow_check`] resolved — drives per-outcome metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +342,7 @@ pub struct LeaseManager<S: Store> {
     breaker: CircuitBreaker,
     config: LeaseConfig,
     fallback: FallbackLimiter,
+    meter_cache: MeterCache,
 }
 
 impl<S: Store> LeaseManager<S> {
@@ -352,12 +354,14 @@ impl<S: Store> LeaseManager<S> {
         config.store_timeout_ms = config.store_timeout_ms.max(1);
         let fallback =
             FallbackLimiter::new(config.max_keys, Duration::from_millis(config.idle_ttl_ms));
+        let meter_cache = MeterCache::new(config.max_keys);
         Self {
             entries: RwLock::new(HashMap::new()),
             store,
             breaker,
             config,
             fallback,
+            meter_cache,
         }
     }
 
@@ -745,6 +749,90 @@ impl<S: Store> LeaseManager<S> {
         }
     }
 
+    fn meter_verdict(rule: &Rule, v: MeterVerdict) -> (Verdict, &'static str) {
+        let verdict = Verdict {
+            allowed: v.under,
+            degraded: false,
+            accounted: true,
+            limit: rule.limit as u32,
+            remaining: 0,
+            reset_s: rule.period_s.ceil().max(0.0) as u32,
+            retry_after_s: if v.under {
+                0
+            } else {
+                ((v.over_ms as f64) / 1000.0).ceil().max(1.0) as u32
+            },
+        };
+        (verdict, if v.under { "meter_under" } else { "meter_over" })
+    }
+
+    /// Meter mode, hot path: a read answered from this sidecar's cache.
+    pub fn meter_cached(
+        &self,
+        key: &str,
+        rule: &Rule,
+        now: Instant,
+    ) -> Option<(Verdict, &'static str)> {
+        self.meter_cache
+            .get(key, now)
+            .map(|v| Self::meter_verdict(rule, v))
+    }
+
+    /// Meter mode: record `cost` against the key's score in the shared store
+    /// (zero only reads) and report whether the score is below `rule.burst`.
+    /// A meter never refuses traffic on its own failure: a store error, timeout
+    /// or open breaker allows and reports degraded, whatever the failure mode.
+    pub async fn meter_check(
+        &self,
+        key: &str,
+        rule: &Rule,
+        cost: f64,
+        now_ms: u64,
+        now: Instant,
+    ) -> (Verdict, &'static str) {
+        let fail_open = (
+            Verdict {
+                allowed: true,
+                degraded: true,
+                accounted: false,
+                limit: 0,
+                remaining: 0,
+                reset_s: 0,
+                retry_after_s: 0,
+            },
+            "meter_fail_open",
+        );
+        if !self.breaker.allow(now) {
+            return fail_open;
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(self.config.store_timeout_ms),
+            self.store.meter(key, rule.rate(), rule.burst, cost, now_ms),
+        )
+        .await
+        {
+            Ok(Ok(v)) => {
+                self.breaker.on_success();
+                self.meter_cache
+                    .put(key, v, Duration::from_millis(self.config.interval_ms), now);
+                Self::meter_verdict(rule, v)
+            }
+            Ok(Err(e)) => {
+                log::warn!("ratelimit: meter for {key} failed (allowing): {e}");
+                self.breaker.on_failure(Instant::now());
+                fail_open
+            }
+            Err(_) => {
+                log::warn!(
+                    "ratelimit: meter for {key} timed out after {}ms (allowing)",
+                    self.config.store_timeout_ms
+                );
+                self.breaker.on_failure(Instant::now());
+                fail_open
+            }
+        }
+    }
+
     /// Exact mode: a synchronous per-request GCRA check against the shared
     /// store. Store failures resolve through the configured failure mode;
     /// local mode is a per-sidecar emergency budget, not fleet-exact GCRA.
@@ -911,6 +999,75 @@ mod tests {
                 ..LeaseConfig::default()
             },
         )
+    }
+
+    const METER_RULE: Rule = Rule {
+        limit: 50.0,
+        period_s: 60.0,
+        burst: 50.0,
+        cost: 1.0,
+    };
+
+    #[tokio::test]
+    async fn meter_charge_on_one_sidecar_reaches_another_within_one_interval() {
+        let store = Arc::new(InMemoryStore::new());
+        let a = mgr(Arc::clone(&store));
+        let b = mgr(Arc::clone(&store));
+        let t0 = Instant::now();
+
+        // B reads first and caches "under".
+        let (v, outcome) = b.meter_check("k", &METER_RULE, 0.0, 0, t0).await;
+        assert!(v.allowed && v.accounted && !v.degraded);
+        assert_eq!(outcome, "meter_under");
+
+        // A charges past the limit: the charge is recorded although it exceeds
+        // what was left, and A sees it at once.
+        assert!(a.meter_check("k", &METER_RULE, 45.0, 0, t0).await.0.allowed);
+        let (v, outcome) = a.meter_check("k", &METER_RULE, 15.0, 0, t0).await;
+        assert!(!v.allowed);
+        assert_eq!(outcome, "meter_over");
+        assert_eq!(v.retry_after_s, 12);
+        assert!(!a.meter_cached("k", &METER_RULE, t0).unwrap().0.allowed);
+
+        // B keeps its cached verdict for one interval, then asks the store.
+        assert!(b.meter_cached("k", &METER_RULE, t0).unwrap().0.allowed);
+        let later = t0 + Duration::from_millis(200);
+        assert!(b.meter_cached("k", &METER_RULE, later).is_none());
+        assert!(
+            !b.meter_check("k", &METER_RULE, 0.0, 200, later)
+                .await
+                .0
+                .allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn meter_read_does_not_charge() {
+        let m = mgr(Arc::new(InMemoryStore::new()));
+        let t0 = Instant::now();
+        assert!(m.meter_check("k", &METER_RULE, 49.0, 0, t0).await.0.allowed);
+        for i in 1..=5u64 {
+            let now = t0 + Duration::from_millis(200 * i);
+            assert!(m.meter_check("k", &METER_RULE, 0.0, 0, now).await.0.allowed);
+        }
+        assert!(!m.meter_check("k", &METER_RULE, 1.0, 0, t0).await.0.allowed);
+    }
+
+    #[tokio::test]
+    async fn meter_allows_and_reports_degraded_when_the_store_fails() {
+        let m = LeaseManager::new(
+            Arc::new(DownStore),
+            CircuitBreaker::new(100, Duration::from_secs(1), Instant::now()),
+            LeaseConfig {
+                exact_failure_mode: StoreFailureMode::Closed,
+                ..LeaseConfig::default()
+            },
+        );
+        let (v, outcome) = m
+            .meter_check("k", &METER_RULE, 5.0, 0, Instant::now())
+            .await;
+        assert!(v.allowed && v.degraded && !v.accounted);
+        assert_eq!(outcome, "meter_fail_open");
     }
 
     #[tokio::test]

@@ -120,6 +120,15 @@ often forbids). Cost: a ~0.3 ms Valkey RTT on **every** request to that key — 
 default eliminates — so exact mode is scoped to the specific keys that need it, never fleet-wide.
 Store errors, timeouts, and an open breaker resolve through `store_failure_mode`.
 
+### Meter mode (opt-in, per key: penalties for earlier behavior)
+
+`mode: meter` is a score, not an admission check. It reuses the GCRA TAT but records every charge,
+so a key can go over `burst` and stays over until the excess drains (debt is capped at `2*burst`).
+A zero cost only reads. Reads run per request, so each sidecar caches the verdict for one lease
+interval `T`: store reads are bounded by `(active_keys x N_pods)/T`, the same shape as lease
+refreshes, and a charge made on one sidecar is seen by the others within `T`. Only a charge or a
+cache miss round-trips the store. A meter never refuses traffic on its own failure.
+
 ### L1 negative cache + circuit breaker
 
 - **L1 negative cache** holds only over-limit/blocked keys (Envoy over-limit + Cloudflare mitigation
