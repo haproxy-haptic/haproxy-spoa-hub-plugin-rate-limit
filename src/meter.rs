@@ -12,8 +12,14 @@ use std::time::{Duration, Instant};
 
 use crate::store::MeterVerdict;
 
+struct Entry {
+    verdict: MeterVerdict,
+    stored: Instant,
+    expiry: Instant,
+}
+
 pub struct MeterCache {
-    entries: Mutex<HashMap<String, (MeterVerdict, Instant)>>,
+    entries: Mutex<HashMap<String, Entry>>,
     max_keys: usize,
 }
 
@@ -25,13 +31,20 @@ impl MeterCache {
         }
     }
 
+    /// `over_ms` counts down from when the verdict was stored.
     pub fn get(&self, key: &str, now: Instant) -> Option<MeterVerdict> {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
-            .filter(|(_, expiry)| now < *expiry)
-            .map(|(verdict, _)| *verdict)
+            .filter(|entry| now < entry.expiry)
+            .map(|entry| MeterVerdict {
+                under: entry.verdict.under,
+                over_ms: entry
+                    .verdict
+                    .over_ms
+                    .saturating_sub(now.duration_since(entry.stored).as_millis() as u64),
+            })
     }
 
     /// Cache `verdict` for `ttl`, but never past the moment an over verdict
@@ -45,12 +58,19 @@ impl MeterCache {
         };
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() >= self.max_keys && !entries.contains_key(key) {
-            entries.retain(|_, (_, expiry)| now < *expiry);
+            entries.retain(|_, entry| now < entry.expiry);
             if entries.len() >= self.max_keys {
                 return;
             }
         }
-        entries.insert(key.to_string(), (verdict, now + ttl));
+        entries.insert(
+            key.to_string(),
+            Entry {
+                verdict,
+                stored: now,
+                expiry: now + ttl,
+            },
+        );
     }
 }
 
@@ -82,8 +102,21 @@ mod tests {
             over_ms: 20,
         };
         cache.put("k", over, Duration::from_millis(100), t0);
-        assert_eq!(cache.get("k", t0 + Duration::from_millis(19)), Some(over));
+        assert_eq!(cache.get("k", t0), Some(over));
         assert_eq!(cache.get("k", t0 + Duration::from_millis(20)), None);
+    }
+
+    #[test]
+    fn a_cached_over_verdict_counts_its_remaining_time_down() {
+        let cache = MeterCache::new(8);
+        let t0 = Instant::now();
+        let over = MeterVerdict {
+            under: false,
+            over_ms: 5000,
+        };
+        cache.put("k", over, Duration::from_millis(200), t0);
+        let hit = cache.get("k", t0 + Duration::from_millis(150)).unwrap();
+        assert_eq!(hit.over_ms, 4850);
     }
 
     #[test]
