@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `mode=meter` keeps a per-key score in the shared store. A `cost` above zero is always recorded, even when it exceeds what is left, and a zero `cost` only reads; the verdict is `allowed=false` while the score is at or above `burst`. Sidecars cache verdicts for `interval_ms`, so reads don't reach the store per request.
+
 ## [0.4.3] - 2026-11-13
 
 ### Fixed

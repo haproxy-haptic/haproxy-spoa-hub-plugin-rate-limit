@@ -210,6 +210,19 @@ impl Store for DeferredValkeyStore {
                 .await,
         )
     }
+
+    async fn meter(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        now_ms: u64,
+    ) -> Result<crate::store::MeterVerdict, StoreError> {
+        let store = self.get_connected().await?;
+        let call = DeferredStoreCall::new(self, Arc::clone(&store));
+        call.finish(store.meter(key, rate, burst, cost, now_ms).await)
+    }
 }
 
 struct ShardedValkeyStore {
@@ -266,6 +279,17 @@ impl Store for ShardedValkeyStore {
             .gcra_check(key, rate, burst, cost, now_ms, ttl_ms)
             .await
     }
+
+    async fn meter(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        now_ms: u64,
+    ) -> Result<crate::store::MeterVerdict, StoreError> {
+        self.shard(key).meter(key, rate, burst, cost, now_ms).await
+    }
 }
 
 impl Store for AnyStore {
@@ -296,6 +320,20 @@ impl Store for AnyStore {
         match self {
             AnyStore::Valkey(s) => s.gcra_check(key, rate, burst, cost, now_ms, ttl_ms).await,
             AnyStore::Memory(s) => s.gcra_check(key, rate, burst, cost, now_ms, ttl_ms).await,
+        }
+    }
+
+    async fn meter(
+        &self,
+        key: &str,
+        rate: f64,
+        burst: f64,
+        cost: f64,
+        now_ms: u64,
+    ) -> Result<crate::store::MeterVerdict, StoreError> {
+        match self {
+            AnyStore::Valkey(s) => s.meter(key, rate, burst, cost, now_ms).await,
+            AnyStore::Memory(s) => s.meter(key, rate, burst, cost, now_ms).await,
         }
     }
 }
@@ -532,6 +570,43 @@ define_plugin!(RateLimitPlugin, {
                 return Ok(build_result(&v));
             }
         };
+
+        // Meter mode: charges are always recorded and a zero cost only reads.
+        // Reads are served from the sidecar's cache; only a miss or a charge
+        // round-trips the store.
+        if message
+            .get_string("mode")
+            .is_some_and(|m| m.eq_ignore_ascii_case("meter"))
+        {
+            let cost = message
+                .get_string("cost")
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|c| c.is_finite() && *c > 0.0)
+                .unwrap_or(0.0);
+            let cached = if cost == 0.0 {
+                manager.meter_cached(key, &rule, Instant::now())
+            } else {
+                None
+            };
+            let (verdict, outcome) = match cached {
+                Some(hit) => hit,
+                None => {
+                    let runtime = state
+                        .runtime
+                        .as_ref()
+                        .ok_or("plugin not initialized: runtime missing")?;
+                    runtime.block_on(manager.meter_check(
+                        key,
+                        &rule,
+                        cost,
+                        wall_ms(),
+                        Instant::now(),
+                    ))
+                }
+            };
+            METRICS.counter("ratelimit_requests_total", &[("outcome", outcome)], 1);
+            return Ok(build_result(&verdict));
+        }
 
         // Exact mode: a synchronous GCRA round-trip per request, scoped to
         // opted-in keys rather than the fleet default.

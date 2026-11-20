@@ -404,3 +404,27 @@ async fn browser_burst_is_fully_admitted_via_borrow_on_empty() {
         "a 60-request page load must sail through burst 300 against real Valkey"
     );
 }
+
+#[tokio::test]
+async fn meter_against_valkey_records_past_burst_reads_for_free_and_drains() {
+    let Some(s) = store_or_skip().await else {
+        return;
+    };
+    let key = unique_key("meter");
+    // Drains 20 points/s; over at 10 points.
+    assert!(s.meter(&key, 20.0, 10.0, 0.0, 0).await.unwrap().under);
+    assert!(s.meter(&key, 20.0, 10.0, 8.0, 0).await.unwrap().under);
+    // 8 + 6 = 14 minus what drained since: over by at most 4 points (200 ms).
+    let v = s.meter(&key, 20.0, 10.0, 6.0, 0).await.unwrap();
+    assert!(!v.under, "a charge past burst must be recorded");
+    assert!(v.over_ms > 0 && v.over_ms <= 200, "over_ms={}", v.over_ms);
+    // Reads see the key over and do not extend it.
+    assert!(!s.meter(&key, 20.0, 10.0, 0.0, 0).await.unwrap().under);
+    tokio::time::sleep(Duration::from_millis(v.over_ms + 20)).await;
+    assert!(s.meter(&key, 20.0, 10.0, 0.0, 0).await.unwrap().under);
+
+    // Debt is capped at twice burst, however large the charge.
+    let capped = unique_key("meter-cap");
+    let v = s.meter(&capped, 20.0, 10.0, 1_000_000.0, 0).await.unwrap();
+    assert!(v.over_ms <= 500, "over_ms={}", v.over_ms);
+}
