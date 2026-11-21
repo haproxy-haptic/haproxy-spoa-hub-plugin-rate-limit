@@ -349,9 +349,46 @@ fn stable_hash64(bytes: &[u8]) -> u64 {
     h
 }
 
-struct PrefetchReq {
-    key: String,
-    now_ms: u64,
+/// Work for the background loop: a lease prefetch on the low-water signal, or
+/// the refresh of a meter verdict that a read served stale.
+enum Background {
+    Lease {
+        key: String,
+        now_ms: u64,
+    },
+    Meter {
+        key: String,
+        rule: Rule,
+        now_ms: u64,
+    },
+}
+
+/// Queue the background refresh of a meter verdict that was just served stale.
+/// Non-blocking: a full or closed queue drops it (counted) and clears the
+/// key's pending mark, so a later stale read queues it again. The read never
+/// falls back to a synchronous store call here: under load that would put the
+/// store on the request path exactly when the queue is full, and the verdict
+/// stays bounded by the stale window either way.
+fn queue_meter_refresh(
+    tx: Option<&Sender<Background>>,
+    manager: &LeaseManager<impl crate::store::Store>,
+    key: &str,
+    rule: &Rule,
+) {
+    let req = Background::Meter {
+        key: key.to_string(),
+        rule: rule.clone(),
+        now_ms: wall_ms(),
+    };
+    let result = match tx.map(|tx| tx.try_send(req)) {
+        Some(Ok(())) => "queued",
+        Some(Err(TrySendError::Full(_))) => "dropped_full",
+        Some(Err(TrySendError::Closed(_))) | None => "dropped_closed",
+    };
+    if result != "queued" {
+        manager.meter_refresh_dropped(key);
+    }
+    METRICS.counter("ratelimit_meter_refresh_total", &[("result", result)], 1);
 }
 
 async fn warm_valkey_connection(store: Arc<DeferredValkeyStore>, on_connect: impl Fn()) {
@@ -401,7 +438,7 @@ fn wall_ms() -> u64 {
 /// plugin's tokio runtime for the process lifetime.
 async fn background(
     manager: std::sync::Arc<LeaseManager<AnyStore>>,
-    mut rx: Receiver<PrefetchReq>,
+    mut rx: Receiver<Background>,
     interval_ms: u64,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
@@ -413,7 +450,14 @@ async fn background(
             }
             maybe = rx.recv() => {
                 match maybe {
-                    Some(req) => manager.refresh(&req.key, req.now_ms, Instant::now()).await,
+                    Some(Background::Lease { key, now_ms }) => {
+                        manager.refresh(&key, now_ms, Instant::now()).await;
+                    }
+                    Some(Background::Meter { key, rule, now_ms }) => {
+                        let answered = manager.meter_refresh(&key, &rule, now_ms, Instant::now()).await;
+                        let result = if answered { "refreshed" } else { "failed" };
+                        METRICS.counter("ratelimit_meter_refresh_total", &[("result", result)], 1);
+                    }
                     None => break, // sender dropped
                 }
             }
@@ -425,7 +469,7 @@ struct PluginState {
     config: PluginConfig,
     runtime: Option<Runtime>,
     manager: Arc<LeaseManager<AnyStore>>,
-    prefetch: Option<Sender<PrefetchReq>>,
+    prefetch: Option<Sender<Background>>,
 }
 
 impl Drop for PluginState {
@@ -493,6 +537,7 @@ define_plugin!(RateLimitPlugin, {
             optimistic_cold_start: config.use_legacy_optimistic_cold_start(),
             borrow_failure_mode: config.lease_store_failure_mode(),
             exact_failure_mode: config.exact_store_failure_mode(),
+            meter_stale_ms: config.meter_stale_ms,
         };
         let manager = Arc::new(LeaseManager::new(Arc::new(store), breaker, lease_cfg));
         for shard in shards {
@@ -572,8 +617,9 @@ define_plugin!(RateLimitPlugin, {
         };
 
         // Meter mode: charges are always recorded and a zero cost only reads.
-        // Reads are served from the sidecar's cache; only a miss or a charge
-        // round-trips the store.
+        // Reads are served from the sidecar's cache, fresh or stale (a stale
+        // read queues one background refresh); only a key with no usable entry
+        // or a charge round-trips the store.
         if message
             .get_string("mode")
             .is_some_and(|m| m.eq_ignore_ascii_case("meter"))
@@ -589,7 +635,12 @@ define_plugin!(RateLimitPlugin, {
                 None
             };
             let (verdict, outcome) = match cached {
-                Some(hit) => hit,
+                Some((verdict, outcome, refresh)) => {
+                    if refresh {
+                        queue_meter_refresh(state.prefetch.as_ref(), manager, key, &rule);
+                    }
+                    (verdict, outcome)
+                }
                 None => {
                     let runtime = state
                         .runtime
@@ -634,7 +685,7 @@ define_plugin!(RateLimitPlugin, {
                 // Bounded, non-blocking: signal the background loop and move on.
                 // The lease manager coalesces per-key refreshes, so a full queue
                 // can safely drop this hint; the periodic refresh loop remains.
-                let req = PrefetchReq {
+                let req = Background::Lease {
                     key: key.to_string(),
                     now_ms: wall_ms(),
                 };
@@ -958,5 +1009,44 @@ mod tests {
             variable.name.as_str(),
             "limit" | "remaining" | "reset" | "retry_after"
         )));
+    }
+
+    const METER_RULE: Rule = Rule {
+        limit: 50.0,
+        period_s: 60.0,
+        burst: 50.0,
+        cost: 1.0,
+    };
+
+    #[tokio::test]
+    async fn a_stale_meter_refresh_dropped_by_a_full_queue_can_be_queued_again() {
+        let manager = LeaseManager::new(
+            Arc::new(InMemoryStore::new()),
+            CircuitBreaker::new(5, Duration::from_secs(5), Instant::now()),
+            LeaseConfig::default(),
+        );
+        let t0 = Instant::now();
+        manager.meter_check("k", &METER_RULE, 0.0, 0, t0).await;
+        let stale = t0 + Duration::from_millis(250);
+
+        // a full queue: the refresh is dropped and the pending mark cleared
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(Background::Lease {
+            key: "other".into(),
+            now_ms: 0,
+        })
+        .unwrap();
+        assert!(manager.meter_cached("k", &METER_RULE, stale).unwrap().2);
+        queue_meter_refresh(Some(&tx), &manager, "k", &METER_RULE);
+        assert!(manager.meter_cached("k", &METER_RULE, stale).unwrap().2);
+
+        // with room, the next stale read's refresh is queued for the key
+        rx.recv().await.unwrap();
+        queue_meter_refresh(Some(&tx), &manager, "k", &METER_RULE);
+        assert!(!manager.meter_cached("k", &METER_RULE, stale).unwrap().2);
+        match rx.recv().await.unwrap() {
+            Background::Meter { key, .. } => assert_eq!(key, "k"),
+            Background::Lease { .. } => panic!("expected the meter refresh"),
+        }
     }
 }

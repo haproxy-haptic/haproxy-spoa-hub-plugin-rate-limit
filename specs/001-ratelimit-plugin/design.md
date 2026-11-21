@@ -126,8 +126,14 @@ Store errors, timeouts, and an open breaker resolve through `store_failure_mode`
 so a key can go over `burst` and stays over until the excess drains (debt is capped at `2*burst`).
 A zero cost only reads. Reads run per request, so each sidecar caches the verdict for one lease
 interval `T`: store reads are bounded by `(active_keys x N_pods)/T`, the same shape as lease
-refreshes, and a charge made on one sidecar is seen by the others within `T`. Only a charge or a
-cache miss round-trips the store. A meter never refuses traffic on its own failure.
+refreshes, and a charge made on one sidecar is seen by the others within `T`. After `T` a verdict
+stays usable for a bounded stale window (`meter_stale_ms`): the first read past `T` is answered
+from it and queues one background refresh on the prefetch channel (deduplicated per key), so a
+key's other reads and later sidecars keep off the store. A full queue drops the refresh rather than
+falling back to a synchronous read, which would put the store on the request path exactly when the
+plugin is loaded; staleness stays bounded by the window. An over verdict is never served past its
+drain. Only a charge or a key with no usable verdict round-trips the store in the request path. A
+meter never refuses traffic on its own failure.
 
 ### L1 negative cache + circuit breaker
 

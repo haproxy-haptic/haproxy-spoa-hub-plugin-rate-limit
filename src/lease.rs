@@ -44,7 +44,7 @@ use crate::bucket::TokenBucket;
 use crate::config::StoreFailureMode;
 use crate::fallback::{FallbackDecision, FallbackLimiter};
 use crate::limiter::Verdict;
-use crate::meter::MeterCache;
+use crate::meter::{Cached, MeterCache};
 use crate::rule::Rule;
 use crate::store::{MeterVerdict, Store};
 
@@ -155,6 +155,10 @@ pub struct LeaseConfig {
     pub borrow_failure_mode: StoreFailureMode,
     /// Store-unavailability policy for synchronous exact checks.
     pub exact_failure_mode: StoreFailureMode,
+    /// Meter mode: how long a verdict past its interval may still answer a
+    /// read while a background refresh replaces it. 0 reads the store
+    /// synchronously once the interval is over.
+    pub meter_stale_ms: u64,
 }
 
 impl Default for LeaseConfig {
@@ -170,6 +174,7 @@ impl Default for LeaseConfig {
             optimistic_cold_start: true,
             borrow_failure_mode: StoreFailureMode::Open,
             exact_failure_mode: StoreFailureMode::Closed,
+            meter_stale_ms: 30_000,
         }
     }
 }
@@ -354,7 +359,10 @@ impl<S: Store> LeaseManager<S> {
         config.store_timeout_ms = config.store_timeout_ms.max(1);
         let fallback =
             FallbackLimiter::new(config.max_keys, Duration::from_millis(config.idle_ttl_ms));
-        let meter_cache = MeterCache::new(config.max_keys);
+        let meter_cache = MeterCache::new(
+            config.max_keys,
+            Duration::from_millis(config.meter_stale_ms),
+        );
         Self {
             entries: RwLock::new(HashMap::new()),
             store,
@@ -766,16 +774,50 @@ impl<S: Store> LeaseManager<S> {
         (verdict, if v.under { "meter_under" } else { "meter_over" })
     }
 
-    /// Meter mode, hot path: a read answered from this sidecar's cache.
+    /// Meter mode, hot path: a read answered from this sidecar's cache, fresh
+    /// or stale; `None` when the key has no usable entry. The third value is
+    /// true for the stale read that should queue a background refresh
+    /// ([`LeaseManager::meter_refresh`]).
     pub fn meter_cached(
         &self,
         key: &str,
         rule: &Rule,
         now: Instant,
-    ) -> Option<(Verdict, &'static str)> {
-        self.meter_cache
-            .get(key, now)
-            .map(|v| Self::meter_verdict(rule, v))
+    ) -> Option<(Verdict, &'static str, bool)> {
+        match self.meter_cache.get(key, now)? {
+            Cached::Fresh(v) => {
+                let (verdict, outcome) = Self::meter_verdict(rule, v);
+                Some((verdict, outcome, false))
+            }
+            Cached::Stale { verdict, refresh } => {
+                let (verdict, _) = Self::meter_verdict(rule, verdict);
+                let outcome = if verdict.allowed {
+                    "meter_stale_under"
+                } else {
+                    "meter_stale_over"
+                };
+                Some((verdict, outcome, refresh))
+            }
+        }
+    }
+
+    /// Meter mode, background: read the key's score from the store and cache
+    /// the verdict, replacing the stale one. A failed read leaves the stale
+    /// verdict in place and lets a later read queue another refresh. Returns
+    /// whether the store answered.
+    pub async fn meter_refresh(&self, key: &str, rule: &Rule, now_ms: u64, now: Instant) -> bool {
+        let (_, outcome) = self.meter_check(key, rule, 0.0, now_ms, now).await;
+        let answered = outcome != "meter_fail_open";
+        if !answered {
+            self.meter_cache.refresh_done(key);
+        }
+        answered
+    }
+
+    /// Meter mode: a queued refresh was dropped (full queue); a later stale
+    /// read may queue another.
+    pub fn meter_refresh_dropped(&self, key: &str) {
+        self.meter_cache.refresh_done(key);
     }
 
     /// Meter mode: record `cost` against the key's score in the shared store
@@ -1029,15 +1071,84 @@ mod tests {
         assert_eq!(v.retry_after_s, 12);
         assert!(!a.meter_cached("k", &METER_RULE, t0).unwrap().0.allowed);
 
-        // B keeps its cached verdict for one interval, then asks the store.
+        // B keeps its cached verdict for one interval. The first read after it
+        // still answers from the cache (stale) and asks for one background
+        // refresh, which brings A's charge over.
         assert!(b.meter_cached("k", &METER_RULE, t0).unwrap().0.allowed);
         let later = t0 + Duration::from_millis(200);
-        assert!(b.meter_cached("k", &METER_RULE, later).is_none());
+        let (v, outcome, refresh) = b.meter_cached("k", &METER_RULE, later).unwrap();
+        assert!(v.allowed && refresh);
+        assert_eq!(outcome, "meter_stale_under");
+        assert!(!b.meter_cached("k", &METER_RULE, later).unwrap().2);
+        assert!(b.meter_refresh("k", &METER_RULE, 200, later).await);
+        let (v, outcome, _) = b.meter_cached("k", &METER_RULE, later).unwrap();
+        assert!(!v.allowed);
+        assert_eq!(outcome, "meter_over");
+    }
+
+    #[tokio::test]
+    async fn meter_without_a_stale_window_reads_the_store_after_the_interval() {
+        let m = LeaseManager::new(
+            Arc::new(InMemoryStore::new()),
+            CircuitBreaker::new(5, Duration::from_secs(5), Instant::now()),
+            LeaseConfig {
+                meter_stale_ms: 0,
+                ..LeaseConfig::default()
+            },
+        );
+        let t0 = Instant::now();
+        m.meter_check("k", &METER_RULE, 0.0, 0, t0).await;
+        assert!(m.meter_cached("k", &METER_RULE, t0).is_some());
         assert!(
-            !b.meter_check("k", &METER_RULE, 0.0, 200, later)
-                .await
-                .0
-                .allowed
+            m.meter_cached("k", &METER_RULE, t0 + Duration::from_millis(200))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn meter_key_without_an_entry_has_no_cached_verdict() {
+        let m = mgr(Arc::new(InMemoryStore::new()));
+        assert!(m.meter_cached("new", &METER_RULE, Instant::now()).is_none());
+    }
+
+    #[tokio::test]
+    async fn meter_failed_refresh_keeps_the_stale_verdict_and_allows_another() {
+        let store = Arc::new(InMemoryStore::new());
+        let healthy = mgr(Arc::clone(&store));
+        let t0 = Instant::now();
+        healthy.meter_check("k", &METER_RULE, 0.0, 0, t0).await;
+        // the same cache, but every later store call fails
+        let down = LeaseManager {
+            entries: RwLock::new(HashMap::new()),
+            store: Arc::new(DownStore),
+            breaker: CircuitBreaker::new(100, Duration::from_secs(1), t0),
+            config: healthy.config,
+            fallback: FallbackLimiter::new(8, Duration::from_secs(1)),
+            meter_cache: healthy.meter_cache,
+        };
+        let later = t0 + Duration::from_millis(250);
+        assert!(down.meter_cached("k", &METER_RULE, later).unwrap().2);
+        assert!(!down.meter_refresh("k", &METER_RULE, 250, later).await);
+        let (v, outcome, refresh) = down.meter_cached("k", &METER_RULE, later).unwrap();
+        assert!(v.allowed && refresh);
+        assert_eq!(outcome, "meter_stale_under");
+    }
+
+    #[tokio::test]
+    async fn meter_over_verdict_is_not_served_past_its_drain() {
+        let m = mgr(Arc::new(InMemoryStore::new()));
+        let t0 = Instant::now();
+        // 60 points against a burst of 50 at 50 points a minute: over for 12 s
+        let (v, _) = m.meter_check("k", &METER_RULE, 60.0, 0, t0).await;
+        assert!(!v.allowed);
+        let (v, outcome, _) = m
+            .meter_cached("k", &METER_RULE, t0 + Duration::from_secs(5))
+            .unwrap();
+        assert!(!v.allowed);
+        assert_eq!(outcome, "meter_stale_over");
+        assert!(
+            m.meter_cached("k", &METER_RULE, t0 + Duration::from_secs(12))
+                .is_none()
         );
     }
 
