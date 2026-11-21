@@ -67,7 +67,7 @@ false, the plugin omits `limit`, `remaining`, `reset`, and `retry_after`.
 |---|---|
 | `lease` (default) | Local token bucket fed by leases from the store. |
 | `exact` | One GCRA round trip to the store per request. |
-| `meter` | A score that drains at `limit` per `period`. A `cost` above zero is always recorded, even past `burst`; a zero or missing `cost` only reads. `allowed` is false while the score is at or above `burst`, for at most one `period`. Each sidecar caches a verdict for `interval_ms`, so reads stay off the store and a key that went over elsewhere is seen within one interval. A store failure allows and sets `degraded`, whatever `store_failure_mode` says. |
+| `meter` | A score that drains at `limit` per `period`. A `cost` above zero is always recorded, even past `burst`; a zero or missing `cost` only reads. `allowed` is false while the score is at or above `burst`, for at most one `period`. Each sidecar caches a verdict for `interval_ms`, so reads stay off the store and a key that went over elsewhere is seen within one interval. After that a verdict answers reads for up to `meter_stale_ms` more (default 30000; 0 turns it off) while one background refresh replaces it, so only a key with no usable verdict reads the store in the request path. An over verdict is never served past the moment the score drains. A store failure allows and sets `degraded`, whatever `store_failure_mode` says. |
 
 Use `meter` to hold a key back because of what it did earlier, for example a
 client whose requests keep scoring in a WAF: read before the expensive check,
@@ -117,7 +117,12 @@ invalid_rule_fail_open = false
 `ratelimit_requests_total{outcome=...}` distinguishes authoritative allowance
 and exhaustion from `exact_fallback_allowed`, `exact_fallback_limited`,
 `exact_fallback_capacity_open`, `exact_fail_open`, `exact_fail_closed`, and the
-corresponding `borrow_*` outcomes.
+corresponding `borrow_*` outcomes. Meter reads report `meter_under`, `meter_over`,
+`meter_stale_under` and `meter_stale_over` (answered from a verdict past its
+interval) and `meter_fail_open`; `ratelimit_meter_refresh_total{result=...}`
+counts the background refreshes those stale reads queue (`queued`, `refreshed`,
+`failed`, `dropped_full`, `dropped_closed`). A dropped refresh is queued again
+by a later stale read.
 
 ## Build & test
 

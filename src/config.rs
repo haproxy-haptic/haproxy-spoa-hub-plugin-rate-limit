@@ -75,6 +75,10 @@ pub struct PluginConfig {
     /// concurrent bursts). Default true; disable to restore pre-0.2
     /// instant-deny behavior.
     pub borrow_on_empty: bool,
+    /// Meter mode: how long (ms) a verdict past `sync_interval_ms` may still
+    /// answer reads while one background refresh replaces it; 0 reads the
+    /// store synchronously once the interval is over. Default 30000.
+    pub meter_stale_ms: u64,
 }
 
 impl PluginConfig {
@@ -154,6 +158,7 @@ impl PluginConfig {
             idle_ttl_ms: get_u64("idle_ttl_ms", 120_000, 1_000, 86_400_000),
             store_timeout_ms: get_u64("store_timeout_ms", 25, 1, 60_000),
             max_prefetch_queue: get_u64("max_prefetch_queue", 8_192, 1, 1_000_000) as usize,
+            meter_stale_ms: get_u64("meter_stale_ms", 30_000, 0, 3_600_000),
             borrow_on_empty: get_bool("borrow_on_empty", true),
         })
     }
@@ -176,7 +181,8 @@ impl PluginConfig {
     "idle_ttl_ms": { "type": "integer", "minimum": 1000 },
     "store_timeout_ms": { "type": "integer", "minimum": 1 },
     "max_prefetch_queue": { "type": "integer", "minimum": 1 },
-    "borrow_on_empty": { "type": "boolean", "description": "Empty local pool escalates to one bounded store borrow before denying (burst correctness); default true" }
+    "borrow_on_empty": { "type": "boolean", "description": "Empty local pool escalates to one bounded store borrow before denying (burst correctness); default true" },
+    "meter_stale_ms": { "type": "integer", "minimum": 0, "maximum": 3600000, "description": "Meter mode: how long a verdict past sync_interval_ms still answers reads while a background refresh replaces it; 0 = synchronous read; default 30000" }
   }
 }"#
     }
