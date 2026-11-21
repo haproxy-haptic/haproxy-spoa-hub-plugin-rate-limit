@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-21
+
 ### Changed
 
 - Meter reads no longer wait for the store when a cached verdict has just expired. A verdict past `interval_ms` keeps answering reads for up to `meter_stale_ms` (new, default 30000, 0 restores the synchronous read) while one background refresh per key replaces it; only a key with no usable verdict still reads the store in the request path. An over verdict is never served past the moment the score drains. Stale answers report `meter_stale_under` / `meter_stale_over`, and `ratelimit_meter_refresh_total{result}` counts the refreshes (#10).
