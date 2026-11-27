@@ -1,0 +1,4 @@
+[[plugins]]
+name = "rate_limit"
+library = "librate_limit_plugin.so"
+messages = ["check"]
