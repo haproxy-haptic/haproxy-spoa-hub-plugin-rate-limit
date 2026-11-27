@@ -1,0 +1,15 @@
+[
+  {
+    "message": "check",
+    "args": {
+      "key": "client",
+      "limit": "50000",
+      "period": "1",
+      "mode": "exact"
+    },
+    "expect": {
+      "rate_limit.allowed": true,
+      "rate_limit.accounted": true
+    }
+  }
+]
