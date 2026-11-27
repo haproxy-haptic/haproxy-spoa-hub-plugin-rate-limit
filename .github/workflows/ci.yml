@@ -110,7 +110,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: haproxy-haptic/haproxy-spoa-hub
-          ref: 087ee5df5f71ee85154331eb9cce26400c40c74c
+          # Hub #19. The driver tests this checkout's ci/pgo fixtures on each PR.
+          ref: bba085a146a6d494046d7c666ecef0197d0139a9
           path: .pgo-tools
           persist-credentials: false
       - run: rustup component add llvm-tools-preview
